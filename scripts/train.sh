@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.launch --nproc_per_node=2 --master_port=12233 --use_env run_train.py \
+CUDA_VISIBLE_DEVICES=0,2,3 python -m torch.distributed.launch --nproc_per_node=2 --master_port=12233 --use_env run_train.py \
 --diff_steps 2000 \
 --lr 0.0001 \
 --learning_steps 140000 \
@@ -13,4 +13,6 @@ CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.launch --nproc_per_node=2 -
 --vocab bert \
 --seq_len 128 \
 --schedule_sampler lossaware \
+--ecc_mode true \
+--ecc_num_aux_copies 2 \
 --notes dialogue
