@@ -44,8 +44,12 @@ Update: Our enhanced version effectively accelerates the training convergence by
 ## Setup:
 The code is based on PyTorch and HuggingFace `transformers`.
 ```bash 
+python3.9 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt 
 ```
+This repository targets the PyTorch 1.9 stack. If you are using Python 3.13 (or another very recent Python), `pip` will fail because `torch==1.9.0+cu111` and some of its transitive dependencies do not publish wheels for that interpreter. Use Python 3.9 for the most reliable setup. If you do not need CUDA 11.1, replace the torch pin in `requirements.txt` with the appropriate wheel variant from the [PyTorch previous versions guide](https://docs.pytorch.org/get-started/previous-versions/).
 
 ## Datasets
 Prepare datasets and put them under the `datasets` folder. Take `datasets/CommonsenseConversation/train.jsonl` as an example. We use four datasets in our paper.

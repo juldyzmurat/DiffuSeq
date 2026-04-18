@@ -1,0 +1,552 @@
+Baseline DiffuSeq Overview
+==========================
+
+This note summarizes the current setup in this repository without proposing
+changes. It focuses on the actual data flow, the main functions involved, and
+the equations that define training and sampling.
+
+
+1. High-level flow
+------------------
+
+Training entry path:
+
+1. scripts/train.sh
+2. scripts/run_train.py
+3. train.py
+4. train_util.py::TrainLoop.run_loop()
+5. diffuseq/gaussian_diffusion.py::training_losses_seq2seq()
+6. diffuseq/transformer_model.py::TransformerNetModel.forward()
+
+Sampling / decoding entry path:
+
+1. scripts/run_decode.py
+2. sample_seq2seq.py
+3. diffuseq/gaussian_diffusion.py::p_sample_loop() or ddim_sample_loop()
+4. diffuseq/transformer_model.py::TransformerNetModel.forward()
+5. diffuseq/rounding.py::denoised_fn_round()
+
+
+2. Core files and responsibilities
+----------------------------------
+
+scripts/train.sh
+- Defines the concrete training run.
+- Current baseline uses:
+  - diffusion_steps = 2000
+  - noise_schedule = sqrt
+  - hidden_dim = 128
+  - seq_len = 128
+  - schedule_sampler = lossaware
+
+scripts/run_train.py
+- Converts the shell arguments into a call to train.py.
+- Creates the checkpoint directory and writes the exact training command.
+
+train.py
+- Loads the tokenizer and embedding table.
+- Builds the dataset.
+- Builds the model and diffusion object.
+- Creates the timestep sampler.
+- Starts TrainLoop.
+
+diffuseq/text_datasets.py
+- Reads JSONL data.
+- Tokenizes src and trg.
+- Builds the concatenated sequence and mask.
+- Returns input_ids and input_mask for each example.
+
+basic_utils.py
+- Loads the default config from diffuseq/config.json.
+- Builds TransformerNetModel and SpacedDiffusion.
+- Loads the random embedding table used to initialize training.
+
+diffuseq/transformer_model.py
+- Defines the denoiser network.
+- This is a BERT-encoder-style model with timestep embeddings added to token
+  representations.
+
+diffuseq/gaussian_diffusion.py
+- Defines forward diffusion, reverse diffusion, training losses, and samplers.
+- This is where the noisy sequence is created and where the model prediction is
+  turned into a reverse-diffusion update.
+
+sample_seq2seq.py
+- Loads the trained model and validation/test data.
+- Constructs the initial noisy state for decoding.
+- Runs ancestral sampling or DDIM.
+- Converts the final embedding sequence back to tokens.
+
+
+3. Sequence layout and mask semantics
+-------------------------------------
+
+The dataset is built in diffuseq/text_datasets.py::helper_tokenize().
+
+For each example:
+
+1. src is tokenized into input_id_x.
+2. trg is tokenized into input_id_y.
+3. The sequence is merged as:
+
+   input_ids = src + [SEP] + trg
+
+4. A mask is created as:
+
+   input_mask = [0] * (len(src) + 1)
+
+This means:
+
+- mask = 0 for the src side and the separator token
+- mask = 1 for the trg side after padding
+
+After padding to seq_len, the padded positions in input_mask are also 1 because
+padding uses 1 as the fill value for the mask.
+
+Important consequence:
+
+- src + [SEP] are treated as anchored / fixed positions
+- trg + [PAD] are treated as the "noisy" region
+
+So this baseline is not "full-sequence diffusion". It is a seq2seq setup where
+the source side is clamped and the target side is diffused / denoised.
+
+
+4. What the dataset returns
+---------------------------
+
+TextDataset.__getitem__() returns:
+
+- arr: the embedding lookup of input_ids using the loaded embedding table
+- out_kwargs:
+  - input_ids
+  - input_mask
+
+However, during training the core diffusion loss rebuilds x_start from
+input_ids again inside training_losses_seq2seq(). The x_start tensor passed in
+from the dataset is effectively not used by the loss in the current setup.
+
+So the real training path relies on:
+
+- input_ids
+- input_mask
+- model.word_embedding
+
+more than on the arr returned by the dataset.
+
+
+5. Model architecture
+---------------------
+
+The denoiser is TransformerNetModel in diffuseq/transformer_model.py.
+
+Main components:
+
+- word_embedding: maps token ids to hidden_dim
+- lm_head: maps hidden_dim back to vocab logits
+- time_embed: MLP applied to sinusoidal timestep embeddings
+- input_up_proj: optional projection from hidden_dim to BERT hidden size
+- input_transformers: BertEncoder
+- position_embeddings
+- LayerNorm and dropout
+- output_down_proj: optional projection from BERT hidden size back to hidden_dim
+
+Forward pass:
+
+1. Compute timestep embedding:
+
+   emb_t = time_embed(timestep_embedding(t))
+
+2. Project x if needed:
+
+   emb_x = input_up_proj(x)    if input_dims != hidden_size
+   emb_x = x                   otherwise
+
+3. Add position and time:
+
+   emb_inputs = pos_emb + emb_x + emb_t
+
+4. Run through BertEncoder:
+
+   h = BertEncoder(emb_inputs)
+
+5. Project back down if needed:
+
+   output = output_down_proj(h)
+
+Important baseline property:
+
+- The model currently does not pass an explicit attention mask into the BERT
+  encoder in TransformerNetModel.forward().
+- So all positions can attend to all positions in the sequence tensor.
+
+
+6. Current diffusion configuration
+----------------------------------
+
+The default config in diffuseq/config.json includes:
+
+- predict_xstart = true
+- rescale_timesteps = true
+- learn_sigma = false
+- noise_schedule = sqrt
+
+The training shell script overrides some values but still uses:
+
+- diffusion_steps = 2000
+- noise_schedule = sqrt
+- schedule_sampler = lossaware
+
+Because predict_xstart = true, the denoiser is trained to predict x_0 directly,
+not epsilon.
+
+
+7. Diffusion equations used in the code
+---------------------------------------
+
+Let:
+
+- beta_t be the variance schedule
+- alpha_t = 1 - beta_t
+- alpha_bar_t = product_{s=1..t} alpha_s
+
+The code precomputes:
+
+- sqrt(alpha_bar_t)
+- sqrt(1 - alpha_bar_t)
+- sqrt(1 / alpha_bar_t)
+- sqrt(1 / alpha_bar_t - 1)
+
+7.1 Beta schedule
+
+For the baseline run, the schedule name is "sqrt". The helper constructs betas
+from a continuous alpha_bar function:
+
+   alpha_bar(u) = 1 - sqrt(u + 0.0001)
+
+and then discretizes it into betas.
+
+7.2 Forward diffusion q(x_t | x_0)
+
+In GaussianDiffusion.q_sample():
+
+   x_t = sqrt(alpha_bar_t) * x_start
+         + sqrt(1 - alpha_bar_t) * noise
+
+where:
+
+- noise ~ N(0, I)
+
+If a mask is provided, the code anchors masked positions as:
+
+   output = where(mask == 0, x_start, x_t)
+
+So in this repo:
+
+- source positions stay clean
+- target positions are diffused
+
+7.3 Initial continuous x_start used in training
+
+Inside training_losses_seq2seq(), the clean token embeddings are:
+
+   x_start_mean = model.get_embeds(input_ids)
+
+Then the code adds an extra small Gaussian perturbation:
+
+   x_start = x_start_mean + std_0 * noise_0
+
+where std_0 is taken from sqrt(1 - alpha_bar_0).
+
+So the training "clean" state is already a slightly perturbed version of the
+embedding table lookup.
+
+7.4 Reverse posterior q(x_{t-1} | x_t, x_0)
+
+The code uses:
+
+   posterior_mean =
+       coef1_t * x_start + coef2_t * x_t
+
+with:
+
+   coef1_t = beta_t * sqrt(alpha_bar_{t-1}) / (1 - alpha_bar_t)
+   coef2_t = (1 - alpha_bar_{t-1}) * sqrt(alpha_t) / (1 - alpha_bar_t)
+
+and posterior variance:
+
+   posterior_variance_t =
+       beta_t * (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)
+
+
+8. Training flow in detail
+--------------------------
+
+8.1 Timestep sampling
+
+In TrainLoop.forward_backward():
+
+1. A batch is split into microbatches.
+2. A timestep t is sampled with schedule_sampler.sample().
+3. training_losses() is called.
+
+The sampler returns:
+
+- t: sampled diffusion step indices
+- weights: importance weights
+
+For the loss-aware sampler, after warmup the probability of each timestep is
+based on the second moment of recent losses.
+
+The importance correction is:
+
+   weight(t) = 1 / (T * p(t))
+
+so the weighted objective stays unbiased.
+
+8.2 Loss construction
+
+Inside training_losses_seq2seq():
+
+1. Read:
+   - input_ids_x
+   - input_ids_mask
+
+2. Re-embed the tokens:
+
+   x_start_mean = model.get_embeds(input_ids_x)
+
+3. Add small Gaussian noise:
+
+   x_start = _get_x_start(x_start_mean, std_0)
+
+4. Sample Gaussian diffusion noise:
+
+   noise ~ N(0, I)
+
+5. Create the partially noised sequence:
+
+   x_t = q_sample(x_start, t, noise, mask=input_ids_mask)
+
+6. Run the denoiser:
+
+   model_output = model(x_t, scaled_t)
+
+Because predict_xstart = true:
+
+   pred_xstart = model_output
+
+7. Compute MSE term:
+
+   mse = mean_flat((x_start - model_output)^2)
+
+Special case at t = 0:
+
+   t0_loss = mean_flat((x_start_mean - pred_xstart)^2)
+
+and the code replaces mse with t0_loss for those examples.
+
+8.3 Token losses
+
+The code also computes a token-level cross-entropy on top of embedding vectors.
+
+Given hidden vectors h and token ids y:
+
+   logits = get_logits(h)
+   ce = CrossEntropy(logits, y)
+
+Two such terms are computed:
+
+1. decoder_nll on x_start
+   - this is an embedding regularizer on the clean embedding state
+
+2. terms["nll"] on pred_xstart with input_mask
+   - this measures token prediction on the predicted x_0
+
+Important baseline detail:
+
+- terms["nll"] is computed and logged
+- but it is NOT included in the final terms["loss"]
+
+The final loss in the code is:
+
+   loss = mse + decoder_nll + tT_loss
+
+where:
+
+   tT_loss = mean_flat((q_mean_variance(x_start, T-1).mean)^2)
+
+So the active training objective is:
+
+   loss = reconstruction_mse + embedding_regularizer + terminal_mean_penalty
+
+not:
+
+   loss = mse + nll + ...
+
+
+9. Sampling / inference flow
+----------------------------
+
+Decoding is handled in sample_seq2seq.py.
+
+For each batch:
+
+1. Read input_ids and input_mask.
+2. Embed the full concatenated sequence:
+
+   x_start = model.get_embeds(input_ids)
+
+3. Sample pure Gaussian noise:
+
+   noise ~ N(0, I)
+
+4. Create the initial state:
+
+   x_noised = where(mask == 0, x_start, noise)
+
+So the source side starts from the true embedding and the target side starts
+from noise.
+
+5. Choose the sampler:
+
+- p_sample_loop() if args.step == diffusion_steps
+- ddim_sample_loop() otherwise
+
+6. Repeatedly update the latent state.
+
+
+10. Reverse-diffusion update equations
+--------------------------------------
+
+10.1 Standard ancestral sampling
+
+In p_mean_variance():
+
+1. Run the model:
+
+   model_output = model(x_t, scaled_t)
+
+2. Because predict_xstart = true:
+
+   pred_xstart = model_output
+
+3. Compute the reverse mean:
+
+   model_mean = q_posterior_mean_variance(pred_xstart, x_t, t).mean
+
+Then p_sample() draws:
+
+   x_{t-1} = model_mean + nonzero_mask * exp(0.5 * log_variance_t) * z
+
+where:
+
+- z ~ N(0, I)
+- nonzero_mask = 0 when t == 0, else 1
+
+If a mask is provided, the source side is re-anchored again:
+
+   x_{t-1} = where(mask == 0, x_start, x_{t-1})
+
+So the source tokens remain fixed at every reverse step.
+
+10.2 DDIM sampling
+
+The DDIM path computes:
+
+   eps = (sqrt(1 / alpha_bar_t) * x_t - pred_xstart)
+         / sqrt(1 / alpha_bar_t - 1)
+
+Then:
+
+   mean_pred =
+       pred_xstart * sqrt(alpha_bar_{t-1})
+       + sqrt(1 - alpha_bar_{t-1} - sigma_t^2) * eps
+
+and:
+
+   x_{t-1} = mean_pred + nonzero_mask * sigma_t * z
+
+Again, if a mask is provided, the source side is clamped back to x_start.
+
+
+11. Rounding during decoding
+----------------------------
+
+sample_seq2seq.py passes denoised_fn_round() into the sampler.
+
+That function:
+
+1. Flattens the predicted embedding vectors.
+2. Finds the nearest token embedding by L2 distance.
+3. Replaces the vectors with the nearest embedding vectors.
+
+So sampling is not purely continuous at decode time. The current sampling script
+can project predicted vectors back onto the embedding table during reverse
+diffusion.
+
+
+12. Final token decoding
+------------------------
+
+After the final sample:
+
+1. Compute vocab logits:
+
+   logits = model.get_logits(sample)
+
+2. Take top-1 token at each position.
+
+3. Use input_mask to recover:
+   - source segment
+   - reference target segment
+   - recovered target segment
+
+The recovered text is taken from the target side of the final sequence.
+
+
+13. Practical baseline observations
+-----------------------------------
+
+1. The source side is always fixed by the mask during both training and
+   inference.
+
+2. The target side is the only region that actually undergoes diffusion.
+
+3. The model predicts a sequence of the same shape as its input. There is no
+   built-in notion of multiple target copies, auxiliary tails, or fusion.
+
+4. The model currently uses no explicit attention mask in the BERT encoder, so
+   the entire sequence interacts globally.
+
+5. The dataset-provided embedding tensor is not the true source of x_start in
+   the loss. The loss rebuilds x_start from input_ids again.
+
+6. Padding positions are part of the masked / noisy region because input_mask is
+   padded with 1.
+
+7. The logged token NLL on pred_xstart is not part of the final scalar loss in
+   the present code.
+
+
+14. Compact mental model of the current baseline
+------------------------------------------------
+
+The current baseline can be summarized as:
+
+- Build one sequence: [src][SEP][trg]
+- Keep src fixed
+- Replace trg with continuous Gaussian noise at inference, or partially diffuse
+  trg during training
+- Use a BERT-style denoiser with timestep embeddings to predict x_0 directly
+- Re-anchor src at every reverse step
+- Decode the final target-side embeddings back to tokens
+
+Equivalently:
+
+- source = conditioning prefix
+- target = diffusion region
+- model output = one denoised sequence of the same shape
+- loss = mainly x_0 reconstruction in embedding space, plus auxiliary
+  regularization terms
+

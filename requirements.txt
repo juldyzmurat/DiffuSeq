@@ -1,12 +1,15 @@
+--find-links https://download.pytorch.org/whl/torch_stable.html
+
+# DiffuSeq depends on the PyTorch 1.9 wheel series, which requires an older
+# Python runtime than modern 3.13 environments.
 bert_score
 blobfile
 nltk
-numpy
+numpy<2
 packaging
 psutil
 PyYAML
 setuptools
-spacy
 torch==1.9.0+cu111
 torchmetrics
 tqdm
