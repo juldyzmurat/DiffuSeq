@@ -1,0 +1,234 @@
+ECC DiffuSeq Overview
+=====================
+
+This note summarizes the ECC implementation on the `ecc` branch and how it
+differs from the baseline DiffuSeq setup.
+
+
+1. Main idea
+------------
+
+The baseline denoiser sees one sequence only:
+
+- `[src][SEP][trg]`
+
+The ECC denoiser still evolves only one diffusion state, called the main copy,
+but it also receives fixed auxiliary noisy target copies inside the transformer.
+
+At both training and inference:
+
+1. initialize `main_t`, `aux1_t`, `aux2_t` as independent noisy versions of the
+   same target region
+2. keep `aux1_t` and `aux2_t` fixed
+3. update only `main_t` across reverse diffusion
+
+
+2. New config knobs
+-------------------
+
+The ECC branch adds:
+
+- `ecc_mode`
+- `ecc_num_aux_copies`
+
+When `ecc_mode = false`, the model behaves like the old baseline.
+When `ecc_mode = true`, the model uses the ECC fusion path.
+
+
+3. Transformer input in ECC mode
+--------------------------------
+
+Let:
+
+- `m_src = 1[input_mask == 0]`
+- `m_trg = 1[input_mask == 1]`
+- `x_t_main` be the evolving main latent
+- `x_t_aux_k` be the fixed auxiliary latent for copy `k`
+
+The implemented model builds four internal blocks of length `L`:
+
+1. source block
+2. main block
+3. aux1 block
+4. aux2 block
+
+The actual tensors are:
+
+  source_block = m_src * x_t_main
+  main_block   = m_trg * x_t_main
+  aux_k_block  = m_trg * x_t_aux_k
+
+Then the transformer input is the concatenation:
+
+  z_t = [source_block ; main_block ; aux1_block ; aux2_block]
+
+Each block also gets:
+
+- the usual position embedding
+- the usual timestep embedding
+- a new copy embedding that tells the transformer whether the token belongs to:
+  - source block
+  - main block
+  - aux1 block
+  - aux2 block
+
+An explicit attention mask is used so that:
+
+- only valid source positions are active in the source block
+- only target/pad positions are active in the main and aux blocks
+
+
+4. ECC readout
+--------------
+
+After the transformer, only two block outputs are used:
+
+- source block output for source positions
+- main block output for target positions
+
+If:
+
+- `h_src` is the source block hidden state
+- `h_main` is the main block hidden state
+
+then the model output returned to diffusion is:
+
+  model_output = where(input_mask == 0, h_src, h_main)
+
+So the diffusion state shape stays exactly the same as the baseline:
+
+  B x L x d
+
+The difference is that the main target hidden states can now attend to aux
+target blocks before being read out.
+
+
+5. Training equations
+---------------------
+
+The clean embeddings are still built the same way:
+
+  x_start_mean = Emb(input_ids)
+  x_start = x_start_mean + std_0 * eps_0
+
+The main copy is diffused as before:
+
+  x_t_main = q(x_t | x_start, t, eps_main)
+
+ECC adds fixed auxiliary copies at the same timestep:
+
+  x_t_aux1 = q(x_t | x_start, t, eps_aux1)
+  x_t_aux2 = q(x_t | x_start, t, eps_aux2)
+
+where:
+
+- `eps_main`
+- `eps_aux1`
+- `eps_aux2`
+
+are independent Gaussian noises.
+
+Only `x_t_main` is the diffusion state passed into the sampler/loss. The aux
+copies are extra model inputs only.
+
+The training loss is still the same scalar objective as the baseline:
+
+  loss = mse + decoder_nll + tT_loss
+
+So ECC changes the denoiser input path, not the top-level loss formula.
+
+
+6. Inference equations
+----------------------
+
+At decode time, ECC initializes three independent noisy copies:
+
+  x_T_main = where(mask == 0, x_start, noise_main)
+  x_T_aux1 = where(mask == 0, x_start, noise_aux1)
+  x_T_aux2 = where(mask == 0, x_start, noise_aux2)
+
+with independent Gaussian noises.
+
+Then for each reverse step `t`:
+
+1. feed `x_t_main`, `x_T_aux1`, `x_T_aux2` into the ECC transformer
+2. predict `pred_xstart`
+3. update only the main latent:
+
+   x_t_main -> x_{t-1}_main
+
+4. keep aux copies fixed:
+
+   x_T_aux1, x_T_aux2
+
+So the implemented ECC inference rule is:
+
+- main copy evolves
+- aux copies stay frozen
+- final decoding uses only the final main copy
+
+
+7. Code flow changes
+--------------------
+
+Baseline training path:
+
+1. `train.py`
+2. `train_util.py`
+3. `diffuseq/gaussian_diffusion.py::training_losses_seq2seq`
+4. `diffuseq/transformer_model.py::forward`
+
+ECC training path:
+
+1. `train.py`
+2. `train_util.py`
+3. `diffuseq/gaussian_diffusion.py::training_losses_seq2seq`
+   - synthesizes independent aux noisy copies
+   - passes `input_mask` and `aux_states` to the model
+4. `diffuseq/transformer_model.py::forward`
+   - enters `_forward_ecc`
+   - builds internal source/main/aux blocks
+   - returns source+main readout
+
+Baseline sampling path:
+
+1. `sample_seq2seq.py`
+2. `diffuseq/gaussian_diffusion.py::p_sample_loop` or `ddim_sample_loop`
+3. `diffuseq/transformer_model.py::forward`
+
+ECC sampling path:
+
+1. `sample_seq2seq.py`
+   - initializes `main`, `aux1`, `aux2` independently
+   - keeps aux copies fixed in `model_kwargs`
+2. `diffuseq/gaussian_diffusion.py::p_sample_loop` or `ddim_sample_loop`
+   - updates only `main`
+3. `diffuseq/transformer_model.py::forward`
+   - fuses main with aux evidence inside attention
+
+
+8. Files changed
+----------------
+
+Main implementation files:
+
+- `diffuseq/config.json`
+- `basic_utils.py`
+- `diffuseq/transformer_model.py`
+- `diffuseq/gaussian_diffusion.py`
+- `sample_seq2seq.py`
+- `scripts/run_train.py`
+- `scripts/train.sh`
+
+
+9. Practical interpretation
+---------------------------
+
+Compared to baseline:
+
+- baseline: one noisy target copy enters the transformer
+- ECC: one evolving main copy enters with two fixed helper copies
+
+The output is still one denoised sequence of shape `B x L x d`, but the target
+portion of that output is now produced after the main block consults the
+auxiliary blocks inside self-attention.

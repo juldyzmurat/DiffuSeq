@@ -580,6 +580,14 @@ class GaussianDiffusion:
 
         return {'pred_xprev':pred_prev, 'pred_xstart':pred_xstart}
 
+    def _get_core_model(self, model):
+        core_model = model
+        if hasattr(core_model, "model"):
+            core_model = core_model.model
+        if hasattr(core_model, "module"):
+            core_model = core_model.module
+        return core_model
+
     def training_losses_seq2seq(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
@@ -594,10 +602,12 @@ class GaussianDiffusion:
                  Some mean or variance settings may also have other keys.
         """
         x_start_fix = x_start # save the orignal x_0
+        model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
         assert 'input_ids' in model_kwargs
-        input_ids_x = model_kwargs.pop('input_ids').to(t.device)
-        input_ids_mask = model_kwargs.pop('input_mask').to(t.device)
-        x_start_mean = model.model.module.get_embeds(input_ids_x)
+        input_ids_x = model_kwargs['input_ids'].to(t.device)
+        input_ids_mask = model_kwargs['input_mask'].to(t.device)
+        core_model = self._get_core_model(model)
+        x_start_mean = core_model.get_embeds(input_ids_x)
         
         std = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod,
                                    th.tensor([0]).to(x_start_mean.device),
@@ -611,12 +621,21 @@ class GaussianDiffusion:
 
         x_t = self.q_sample(x_start, t, noise=noise, mask=input_ids_mask) # reparametrization trick.
 
-        get_logits = model.model.module.get_logits
+        get_logits = core_model.get_logits
 
         terms = {}
 
         target = x_start
-        model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+        model_call_kwargs = {}
+        if getattr(core_model, "ecc_mode", False):
+            aux_states = []
+            for _ in range(core_model.ecc_num_aux_copies):
+                aux_noise = th.randn_like(x_start)
+                aux_states.append(self.q_sample(x_start, t, noise=aux_noise, mask=input_ids_mask))
+            model_call_kwargs["input_mask"] = input_ids_mask
+            model_call_kwargs["aux_states"] = aux_states
+
+        model_output = model(x_t, self._scale_timesteps(t), **model_call_kwargs)
         assert model_output.shape == target.shape == x_start.shape
         terms["mse"] = mean_flat((target - model_output) ** 2)
 

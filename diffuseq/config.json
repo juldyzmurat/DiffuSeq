@@ -35,5 +35,7 @@
   "rescale_timesteps": true,
   "rescale_learned_sigmas": false,
   "sigma_small": false,
-  "emb_scale_factor": 1.0
+  "emb_scale_factor": 1.0,
+  "ecc_mode": false,
+  "ecc_num_aux_copies": 2
 }

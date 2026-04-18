@@ -38,6 +38,8 @@ class TransformerNetModel(nn.Module):
         vocab_size=None,
         init_pretrained='no',
         logits_mode=1,
+        ecc_mode=False,
+        ecc_num_aux_copies=2,
     ):
         super().__init__()
 
@@ -51,6 +53,8 @@ class TransformerNetModel(nn.Module):
         self.dropout = dropout
         self.logits_mode = logits_mode
         self.hidden_size = config.hidden_size
+        self.ecc_mode = ecc_mode
+        self.ecc_num_aux_copies = ecc_num_aux_copies
 
         self.word_embedding = nn.Embedding(vocab_size, self.input_dims)
         self.lm_head = nn.Linear(self.input_dims, vocab_size)
@@ -103,6 +107,10 @@ class TransformerNetModel(nn.Module):
             self.output_down_proj = nn.Sequential(nn.Linear(config.hidden_size, config.hidden_size),
                                                 nn.Tanh(), nn.Linear(config.hidden_size, self.output_dims))
 
+        if self.ecc_mode:
+            # Block ids: source block, main block, then one id per fixed aux block.
+            self.copy_embeddings = nn.Embedding(2 + self.ecc_num_aux_copies, config.hidden_size)
+
     def get_embeds(self, input_ids):
         return self.word_embedding(input_ids)
 
@@ -124,7 +132,85 @@ class TransformerNetModel(nn.Module):
             raise NotImplementedError
 
 
-    def forward(self, x, timesteps):
+    def _project_inputs(self, x):
+        if self.input_dims != self.hidden_size:
+            return self.input_up_proj(x)
+        return x
+
+    def _project_outputs(self, hidden_states, dtype):
+        if self.output_dims != self.hidden_size:
+            hidden_states = self.output_down_proj(hidden_states)
+        return hidden_states.type(dtype)
+
+    def _run_encoder(self, emb_inputs, attention_mask=None):
+        emb_inputs = self.dropout(self.LayerNorm(emb_inputs))
+        if attention_mask is None:
+            return self.input_transformers(emb_inputs).last_hidden_state
+
+        extended_attention_mask = attention_mask[:, None, None, :].to(dtype=emb_inputs.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        return self.input_transformers(
+            emb_inputs,
+            attention_mask=extended_attention_mask,
+        ).last_hidden_state
+
+    def _forward_ecc(self, x, emb_t, input_mask, aux_states):
+        if input_mask is None:
+            raise ValueError("ECC mode requires input_mask.")
+        if aux_states is None:
+            raise ValueError("ECC mode requires fixed aux_states.")
+        if len(aux_states) != self.ecc_num_aux_copies:
+            raise ValueError(
+                f"Expected {self.ecc_num_aux_copies} aux states, got {len(aux_states)}."
+            )
+
+        source_mask = input_mask == 0
+        target_mask = input_mask == 1
+        zero_block = th.zeros_like(x)
+
+        block_inputs = [
+            th.where(source_mask.unsqueeze(-1), x, zero_block),
+            th.where(target_mask.unsqueeze(-1), x, zero_block),
+        ]
+        valid_masks = [source_mask, target_mask]
+
+        for aux_state in aux_states:
+            if aux_state.shape != x.shape:
+                raise ValueError("Each aux state must match the main latent shape.")
+            block_inputs.append(th.where(target_mask.unsqueeze(-1), aux_state, zero_block))
+            valid_masks.append(target_mask)
+
+        cat_inputs = th.cat(block_inputs, dim=1)
+        emb_x = self._project_inputs(cat_inputs)
+
+        seq_length = x.size(1)
+        num_blocks = len(block_inputs)
+        total_seq_length = seq_length * num_blocks
+        position_ids = self.position_ids[:, :seq_length].repeat(1, num_blocks)
+        copy_ids = th.cat(
+            [
+                th.full((1, seq_length), idx, device=x.device, dtype=th.long)
+                for idx in range(num_blocks)
+            ],
+            dim=1,
+        )
+
+        emb_inputs = (
+            self.position_embeddings(position_ids)
+            + self.copy_embeddings(copy_ids)
+            + emb_x
+            + emb_t.unsqueeze(1).expand(-1, total_seq_length, -1)
+        )
+        attention_mask = th.cat(valid_masks, dim=1).to(device=x.device, dtype=emb_inputs.dtype)
+        hidden_states = self._run_encoder(emb_inputs, attention_mask=attention_mask)
+
+        source_hidden = hidden_states[:, :seq_length, :]
+        main_hidden = hidden_states[:, seq_length : 2 * seq_length, :]
+        source_output = self._project_outputs(source_hidden, x.dtype)
+        main_output = self._project_outputs(main_hidden, x.dtype)
+        return th.where(source_mask.unsqueeze(-1), source_output, main_output)
+
+    def forward(self, x, timesteps, input_mask=None, aux_states=None):
         """
         Apply the model to an input batch.
 
@@ -134,22 +220,13 @@ class TransformerNetModel(nn.Module):
         """
         emb_t = self.time_embed(timestep_embedding(timesteps, self.hidden_t_dim))
 
-        if self.input_dims != self.hidden_size:
-            emb_x = self.input_up_proj(x)
-        else:
-            emb_x = x
+        if self.ecc_mode:
+            return self._forward_ecc(x, emb_t, input_mask=input_mask, aux_states=aux_states)
+
+        emb_x = self._project_inputs(x)
 
         seq_length = x.size(1)
         position_ids = self.position_ids[:, : seq_length ]
-        # print(emb_x.shape, emb_t.shape, self.position_embeddings)
         emb_inputs = self.position_embeddings(position_ids) + emb_x + emb_t.unsqueeze(1).expand(-1, seq_length, -1)
-        emb_inputs = self.dropout(self.LayerNorm(emb_inputs))
-
-        input_trans_hidden_states = self.input_transformers(emb_inputs).last_hidden_state
-        
-        if self.output_dims != self.hidden_size:
-            h = self.output_down_proj(input_trans_hidden_states)
-        else:
-            h = input_trans_hidden_states
-        h = h.type(x.dtype)
-        return h
+        input_trans_hidden_states = self._run_encoder(emb_inputs)
+        return self._project_outputs(input_trans_hidden_states, x.dtype)

@@ -144,14 +144,23 @@ def main():
 
         input_ids_x = cond.pop('input_ids').to(dist_util.dev())
         x_start = model.get_embeds(input_ids_x)
-        input_ids_mask = cond.pop('input_mask')
-        input_ids_mask_ori = input_ids_mask
+        input_ids_mask_ori = cond.pop('input_mask')
+        input_ids_mask_dev = input_ids_mask_ori.to(dist_util.dev())
 
-        noise = th.randn_like(x_start)
-        input_ids_mask = th.broadcast_to(input_ids_mask.unsqueeze(dim=-1), x_start.shape).to(dist_util.dev())
-        x_noised = th.where(input_ids_mask == 0, x_start, noise)
+        noise_main = th.randn_like(x_start)
+        input_ids_mask = th.broadcast_to(input_ids_mask_dev.unsqueeze(dim=-1), x_start.shape)
+        x_noised = th.where(input_ids_mask == 0, x_start, noise_main)
 
         model_kwargs = {}
+        if getattr(model, "ecc_mode", False):
+            aux_states = []
+            for _ in range(model.ecc_num_aux_copies):
+                aux_noise = th.randn_like(x_start)
+                aux_states.append(th.where(input_ids_mask == 0, x_start, aux_noise))
+            model_kwargs = {
+                "input_mask": input_ids_mask_dev,
+                "aux_states": aux_states,
+            }
 
         if args.step == args.diffusion_steps:
             args.use_ddim = False
