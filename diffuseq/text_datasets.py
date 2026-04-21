@@ -143,7 +143,7 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
     lm_datasets = tokenized_datasets.map(
         pad_function,
         batched=True,
-        num_proc=1,
+        num_proc=4,
         desc=f"padding",
     )
 
@@ -221,7 +221,7 @@ def _collate_batch_helper(examples, pad_token_id, max_length, return_mask=False)
     for i, example in enumerate(examples):
         curr_len = min(len(example), max_length)
         result[i][:curr_len] = example[:curr_len]
-        mask_[i][:curr_len] = [1] * curr_len
+        mask_[i][:curr_len] = example[:curr_len]
     if return_mask:
         return result, mask_
     return result
