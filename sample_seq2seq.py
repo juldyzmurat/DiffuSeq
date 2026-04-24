@@ -29,12 +29,48 @@ from basic_utils import (
 
 def create_argparser():
     defaults = dict(model_path='', step=0, out_dir='', top_p=0)
-    decode_defaults = dict(split='valid', clamp_step=0, seed2=105, clip_denoised=False)
+    decode_defaults = dict(
+        split='valid',
+        clamp_step=0,
+        seed2=105,
+        clip_denoised=False,
+        save_intermediate=True,
+    )
     defaults.update(load_defaults_config())
     defaults.update(decode_defaults)
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)
     return parser
+
+
+def _sampling_timesteps(diffusion, use_ddim, gap):
+    indices = list(range(diffusion.num_timesteps))[::-1]
+    if use_ddim:
+        return indices[::gap]
+    return indices
+
+
+def _decode_target_texts(model, tokenizer, latent, input_ids_mask_ori, seq_len):
+    logits = model.get_logits(latent)
+    cands = th.topk(logits, k=1, dim=-1)
+
+    decoded = []
+    for seq, input_mask in zip(cands.indices, input_ids_mask_ori):
+        len_x = seq_len - sum(input_mask).tolist()
+        decoded.append(tokenizer.decode_token(seq[len_x:]))
+    return decoded
+
+
+def _decode_source_and_reference(tokenizer, input_ids_x, input_ids_mask_ori, seq_len):
+    sources = []
+    references = []
+
+    for seq, input_mask in zip(input_ids_x, input_ids_mask_ori):
+        len_x = seq_len - sum(input_mask).tolist()
+        sources.append(tokenizer.decode_token(seq[:len_x]))
+        references.append(tokenizer.decode_token(seq[len_x:]))
+
+    return sources, references
 
 
 @th.no_grad()
@@ -107,6 +143,7 @@ def main():
     if not os.path.isdir(out_path):
         os.mkdir(out_path)
     out_path = os.path.join(out_path, f"seed{args.seed2}_step{args.clamp_step}.json")
+    intermediate_out_path = out_path.replace('.json', '.intermediate.json')
     # fout = open(out_path, 'a')
 
     all_test_data = []
@@ -169,53 +206,72 @@ def main():
             args.use_ddim = True
             step_gap = args.diffusion_steps//args.step
 
-        sample_fn = (
-            diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
+        progressive_sample_fn = (
+            diffusion.p_sample_loop_progressive
+            if not args.use_ddim
+            else diffusion.ddim_sample_loop_progressive
         )
 
         sample_shape = (x_start.shape[0], args.seq_len, args.hidden_dim)
+        sampling_timesteps = _sampling_timesteps(diffusion, args.use_ddim, step_gap)
 
-        samples = sample_fn(
-            model,
-            sample_shape,
+        progressive_kwargs = dict(
+            model=model,
+            shape=sample_shape,
             noise=x_noised,
             clip_denoised=args.clip_denoised,
             denoised_fn=partial(denoised_fn_round, args, model_emb),
             model_kwargs=model_kwargs,
-            top_p=args.top_p,
-            clamp_step=args.clamp_step,
-            clamp_first=True,
             mask=input_ids_mask,
             x_start=x_start,
-            gap=step_gap
         )
+        if args.use_ddim:
+            progressive_kwargs["gap"] = step_gap
+        else:
+            progressive_kwargs["top_p"] = args.top_p
+            progressive_kwargs["clamp_step"] = args.clamp_step
+            progressive_kwargs["clamp_first"] = True
 
-        # print(samples[0].shape) # samples for each step
+        stepwise_recoveries = [[] for _ in range(x_start.shape[0])]
+        final_sample = None
 
-        sample = samples[-1]
+        for step_index, (timestep, step_out) in enumerate(
+            zip(sampling_timesteps, progressive_sample_fn(**progressive_kwargs))
+        ):
+            final_sample = step_out["sample"]
+            if args.save_intermediate:
+                decoded_step = _decode_target_texts(
+                    model,
+                    tokenizer,
+                    step_out["pred_xstart"],
+                    input_ids_mask_ori,
+                    args.seq_len,
+                )
+                for example_idx, recover_text in enumerate(decoded_step):
+                    stepwise_recoveries[example_idx].append(
+                        {
+                            "step_index": step_index,
+                            "timestep": int(timestep),
+                            "recover": recover_text,
+                        }
+                    )
 
-        # print('decoding for seq2seq', )
-        # print(sample.shape)
+        if final_sample is None:
+            raise RuntimeError("Sampling produced no outputs.")
 
-        logits = model.get_logits(sample)  # bsz, seqlen, vocab
-        cands = th.topk(logits, k=1, dim=-1)
-
-        word_lst_recover = []
-        word_lst_ref = []
-        word_lst_source = []
-
-        # tokenizer = load_tokenizer(args)
-
-        for seq, input_mask in zip(cands.indices, input_ids_mask_ori):
-            len_x = args.seq_len - sum(input_mask).tolist()
-            tokens = tokenizer.decode_token(seq[len_x:])
-            word_lst_recover.append(tokens)
-
-        for seq, input_mask in zip(input_ids_x, input_ids_mask_ori):
-            # tokens = tokenizer.decode_token(seq)
-            len_x = args.seq_len - sum(input_mask).tolist()
-            word_lst_source.append(tokenizer.decode_token(seq[:len_x]))
-            word_lst_ref.append(tokenizer.decode_token(seq[len_x:]))
+        word_lst_recover = _decode_target_texts(
+            model,
+            tokenizer,
+            final_sample,
+            input_ids_mask_ori,
+            args.seq_len,
+        )
+        word_lst_source, word_lst_ref = _decode_source_and_reference(
+            tokenizer,
+            input_ids_x,
+            input_ids_mask_ori,
+            args.seq_len,
+        )
 
         for i in range(world_size):
             if i == rank:  # Write files sequentially
@@ -223,10 +279,27 @@ def main():
                 for (recov, ref, src) in zip(word_lst_recover, word_lst_ref, word_lst_source):
                     print(json.dumps({"recover": recov, "reference": ref, "source": src}), file=fout)
                 fout.close()
+
+                if args.save_intermediate:
+                    fout_intermediate = open(intermediate_out_path, 'a')
+                    for (recoveries, ref, src) in zip(stepwise_recoveries, word_lst_ref, word_lst_source):
+                        print(
+                            json.dumps(
+                                {
+                                    "source": src,
+                                    "reference": ref,
+                                    "recover_steps": recoveries,
+                                }
+                            ),
+                            file=fout_intermediate,
+                        )
+                    fout_intermediate.close()
             dist.barrier()
 
     print('### Total takes {:.2f}s .....'.format(time.time() - start_t))
     print(f'### Written the decoded output to {out_path}')
+    if args.save_intermediate:
+        print(f'### Written intermediate reconstructed texts to {intermediate_out_path}')
 
 
 if __name__ == "__main__":
