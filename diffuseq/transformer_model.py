@@ -45,6 +45,12 @@ class TransformerNetModel(nn.Module):
             config = AutoConfig.from_pretrained(config_name)
             config.hidden_dropout_prob = dropout
 
+        # Newer transformers releases expect an explicit attention backend.
+        # The original DiffuSeq code targeted older versions where this was
+        # implicit, so default to the standard eager implementation here.
+        if getattr(config, "_attn_implementation", None) is None:
+            config._attn_implementation = "eager"
+
         self.input_dims = input_dims
         self.hidden_t_dim = hidden_t_dim
         self.output_dims = output_dims
