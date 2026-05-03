@@ -1,0 +1,901 @@
+Transformer Baseline and ECC Detailed Spec
+==========================================
+
+Purpose
+-------
+This document is a repo-grounded, prompt-ready explanation of the baseline and
+ECC transformer behavior in DiffuSeq. It is written so you can give it to
+another AI system to generate detailed architecture diagrams, transformer
+schematics, and step-by-step flowcharts.
+
+The main questions answered here are:
+
+1. Does the collapse of the main and auxiliary noisy copies happen in the first
+   transformer layer, the last layer, or all layers?
+2. What is a transformer layer, and what does each layer look like internally?
+
+
+Code Grounding
+--------------
+Relevant files in this repo:
+
+- `diffuseq/transformer_model.py`
+- `diffuseq/gaussian_diffusion.py`
+- `diffuseq/text_datasets.py`
+- `sample_seq2seq.py`
+- `basic_utils.py`
+- `diffuseq/config.json`
+
+Important implementation facts:
+
+- The denoiser is `TransformerNetModel`.
+- The transformer core is a HuggingFace `BertEncoder`.
+- In the usual setup:
+  - external latent dimension `hidden_dim = 128`
+  - internal BERT hidden size = 768 for `bert-base-uncased`
+  - BERT-base architecture = 12 encoder layers, 12 attention heads
+- `predict_xstart = true`, so the denoiser predicts a denoised latent
+  embedding `x_0`, not epsilon/noise.
+
+
+Short Answers First
+-------------------
+
+Q1. Does ECC collapse the main and aux copies in the first layer, the last
+layer, or all layers?
+
+Answer:
+
+- The ECC multi-copy tensor is constructed before the first transformer layer.
+- All transformer layers operate on the expanded multi-block sequence.
+- The copies are not collapsed after the first layer.
+- The copies are not collapsed inside every layer.
+- The collapse/readout happens once, after the last transformer layer output is
+  produced.
+
+More precisely, ECC does:
+
+1. build a combined hidden-state input `H^(0)` containing source, main, and
+   auxiliary blocks
+2. pass that full combined sequence through all transformer layers
+3. after the final layer, slice out:
+   - source block output
+   - main block output
+4. return a single output sequence by choosing:
+   - source positions from the source block
+   - target positions from the main block
+
+So the answer is: collapse happens at the final readout after the last layer,
+not at the first layer and not repeatedly at all layers.
+
+
+Q2. What is a transformer layer?
+
+Answer:
+
+In this repo, one transformer layer is one BERT encoder block.
+
+At a high level, one layer takes an input hidden-state matrix `H^(l)` and
+produces an updated hidden-state matrix `H^(l+1)` by applying:
+
+1. multi-head self-attention
+2. residual connection + layer norm
+3. feed-forward MLP
+4. residual connection + layer norm
+
+Mathematically, one layer looks like:
+
+For each attention head `m`:
+
+`Q_m = H^(l) W_m^Q`
+`K_m = H^(l) W_m^K`
+`V_m = H^(l) W_m^V`
+
+`A_m = softmax((Q_m K_m^T) / sqrt(d_k) + M)`
+
+`head_m = A_m V_m`
+
+Then concatenate heads:
+
+`Z = Concat(head_1, ..., head_M) W^O`
+
+First residual block:
+
+`U = LayerNorm(H^(l) + Dropout(Z))`
+
+Feed-forward sublayer:
+
+`F = W_2 GELU(W_1 U + b_1) + b_2`
+
+Second residual block:
+
+`H^(l+1) = LayerNorm(U + Dropout(F))`
+
+That is the definition of a single transformer layer in the encoder stack.
+
+
+Part I. Baseline DiffuSeq
+=========================
+
+1. Data packing and masks
+-------------------------
+
+Each training example is packed as:
+
+`[src] [SEP] [trg]`
+
+The preprocessing builds:
+
+- `input_ids = src + [SEP] + trg`
+- `input_mask`
+
+Mask meaning:
+
+- `input_mask == 0` for `src + [SEP]`
+- `input_mask == 1` for target region and padded tail
+
+Important point:
+
+- The mask is used for diffusion anchoring.
+- In the baseline transformer path, no explicit attention mask is passed to the
+  BERT encoder.
+- So baseline self-attention is fully bidirectional over the whole packed
+  sequence tensor.
+
+
+2. Baseline latent objects
+--------------------------
+
+Let:
+
+- `B` = batch size
+- `L` = packed sequence length
+- `d_in = hidden_dim = 128`
+- `d_model = BERT hidden size = 768`
+- `Vocab` = vocabulary size, usually 30522 for BERT vocab
+
+Then:
+
+- token embedding space used by diffusion model: `R^(d_in)`
+- internal transformer hidden space: `R^(d_model)`
+
+The model uses:
+
+- `word_embedding : token_id -> R^(d_in)`
+- optional `input_up_proj : R^(d_in) -> R^(d_model)`
+- optional `output_down_proj : R^(d_model) -> R^(d_in)`
+- timestep embedding MLP
+- positional embeddings
+- BERT encoder stack
+- language-model readout head tied to token embeddings
+
+
+3. Baseline training flow
+-------------------------
+
+Step 1. Build clean token embeddings.
+
+For token ids `w`:
+
+`x_start_mean = Emb(w)`
+
+Shape:
+
+`x_start_mean in R^(B x L x d_in)`
+
+Step 2. Build noisy clean-state training target.
+
+The code perturbs `x_start_mean` at timestep 0-style scale to form the clean
+training target `x_start`:
+
+`x_start = x_start_mean + std_0 * eps_0`
+
+Step 3. Diffuse only the target side.
+
+At arbitrary timestep `t`, the forward process forms:
+
+`x_t = q(x_t | x_start, t)`
+
+but source positions are anchored by the mask:
+
+`x_t = where(input_mask == 0, x_start, noisy_target)`
+
+So:
+
+- source side stays fixed
+- target side is noised
+
+Step 4. Feed `x_t` into the denoiser.
+
+The baseline denoiser does:
+
+`emb_x = UpProj(x_t)` if needed, otherwise `emb_x = x_t`
+
+`emb_t = TimeMLP(timestep_embedding(t))`
+
+`H^(0) = emb_x + PosEmb + emb_t`
+
+Then all transformer layers act on:
+
+`H^(0) in R^(B x L x d_model)`
+
+Step 5. Transformer stack.
+
+For layers `l = 0, 1, ..., N-1`:
+
+`H^(l+1) = TransformerLayer_l(H^(l))`
+
+There is no encoder-decoder cross-attention here. It is one encoder stack with
+self-attention over the full packed sequence.
+
+Step 6. Project back to diffusion dimension.
+
+After final layer `N`:
+
+`H_out = DownProj(H^(N))`
+
+This is the denoiser output:
+
+`model_output in R^(B x L x d_in)`
+
+Because `predict_xstart = true`, this `model_output` is interpreted as:
+
+`pred_xstart = hat(x_0)`
+
+Step 7. Losses.
+
+Main denoising loss:
+
+`MSE = ||x_start - model_output||^2`
+
+At `t = 0`, the code uses:
+
+`MSE_t0 = ||x_start_mean - model_output||^2`
+
+Additional terms:
+
+- token-level decoder cross entropy on `x_start`
+- terminal prior term `tT_loss`
+
+Total optimized loss:
+
+`loss = mse + decoder_nll + tT_loss`
+
+
+4. Baseline inference flow
+--------------------------
+
+Step 1. Initialize from source-anchored noise.
+
+At sampling start:
+
+`x_T = where(mask == 0, x_start, noise)`
+
+So:
+
+- source positions are fixed to source embeddings
+- target positions start from random noise
+
+Step 2. Reverse diffusion loop.
+
+For `t = T, T-1, ..., 1, 0`:
+
+2.1. Predict denoised latent:
+
+`hat(x_0)^(t) = f_theta(x_t, t)`
+
+2.2. Optional rounding in the provided decode script:
+
+The script passes `denoised_fn_round`, which snaps `hat(x_0)^(t)` to the
+nearest token embedding before using it in the posterior update. This is
+nearest-neighbor rounding in embedding space, not direct argmax over logits.
+
+So practically the sampler may use:
+
+`hat(x_0)_rounded^(t) = RoundToNearestTokenEmbedding(hat(x_0)^(t))`
+
+2.3. Compute posterior mean:
+
+`mu_t = c1(t) * hat(x_0)^(t) + c2(t) * x_t`
+
+where:
+
+`c1(t) = sqrt(alpha_bar_(t-1)) * beta_t / (1 - alpha_bar_t)`
+`c2(t) = sqrt(alpha_t) * (1 - alpha_bar_(t-1)) / (1 - alpha_bar_t)`
+
+2.4. Sample the next latent:
+
+`x_(t-1) = mu_t + 1[t > 0] * sigma_t * z`
+
+with:
+
+`z ~ N(0, I)`
+
+2.5. Re-anchor the source:
+
+`x_(t-1) = where(mask == 0, x_start, x_(t-1))`
+
+Step 3. Final decoding to tokens.
+
+After the final latent is produced:
+
+`logits = LMHead(final_latent)`
+
+`token = argmax(logits)`
+
+Important distinction:
+
+- during diffusion, states are continuous latents
+- discrete tokens are produced only at the final readout step
+
+
+5. What the baseline transformer layers should look like in a diagram
+---------------------------------------------------------------------
+
+A detailed diagram for baseline should show:
+
+1. Input packed sequence:
+   `[src][SEP][trg]`
+2. Source-target mask:
+   source fixed, target noisy
+3. Latent tensor:
+   `x_t in R^(B x L x 128)`
+4. Up-projection:
+   `128 -> 768`
+5. Add:
+   - position embedding
+   - timestep embedding
+6. Repeated BERT encoder layers:
+   for each layer show:
+   - Q/K/V projections
+   - scaled dot-product self-attention
+   - multi-head concat + output projection
+   - residual + layer norm
+   - feed-forward MLP
+   - residual + layer norm
+7. Down-projection:
+   `768 -> 128`
+8. Output denoised latent `hat(x_0)`
+9. Posterior update:
+   `hat(x_0), x_t -> x_(t-1)`
+10. Final LM head over full vocabulary
+
+
+Part II. ECC DiffuSeq
+=====================
+
+1. ECC idea
+-----------
+
+ECC keeps one evolving main diffusion latent, but gives the transformer extra
+fixed noisy target copies as additional context.
+
+So compared to baseline:
+
+- baseline: one packed latent sequence enters the denoiser
+- ECC: one main latent plus one or more auxiliary target copies enter the
+  denoiser together
+
+Important:
+
+- only the main copy evolves across reverse diffusion
+- auxiliary copies are helper evidence
+- auxiliary copies are not directly decoded
+
+
+2. ECC variables
+----------------
+
+Let:
+
+- `x_t_main` = evolving main latent at timestep `t`
+- `x_aux^(r)` = auxiliary copy `r`
+- `m_src = 1[input_mask == 0]`
+- `m_trg = 1[input_mask == 1]`
+- `K = number of auxiliary copies`
+
+Then ECC creates internal blocks of length `L`:
+
+- source block
+- main block
+- aux block 1
+- ...
+- aux block K
+
+For the common conceptual case `K = 1`, there are two noisy target copies:
+
+- main
+- aux
+
+For the more general code path:
+
+- there may be multiple aux copies
+
+
+3. ECC training flow
+--------------------
+
+Step 1. Build the same clean embeddings:
+
+`x_start_mean = Emb(w)`
+
+Step 2. Build clean latent target:
+
+`x_start = x_start_mean + std_0 * eps_0`
+
+Step 3. Main noisy latent:
+
+`x_t_main = q(x_t | x_start, t, eps_main)`
+
+with source anchoring:
+
+`x_t_main = where(mask == 0, x_start, noisy_main)`
+
+Step 4. Auxiliary noisy latents.
+
+For each auxiliary copy `r`:
+
+`x_t_aux^(r) = q(x_t | x_start, t, eps_aux^(r))`
+
+again with source anchoring:
+
+`x_t_aux^(r) = where(mask == 0, x_start, noisy_aux^(r))`
+
+All noises are independent.
+
+Step 5. Build ECC block inputs.
+
+ECC splits the sequence using the mask:
+
+`X_src  = m_src * x_t_main`
+`X_main = m_trg * x_t_main`
+`X_aux^(r) = m_trg * x_t_aux^(r)`
+
+This means:
+
+- source block keeps only source positions from the main latent
+- main block keeps only target positions from the main latent
+- each aux block keeps only target positions from the corresponding aux latent
+
+All other positions in each block are zeroed.
+
+Step 6. Concatenate blocks along sequence dimension.
+
+`X_cat = [X_src ; X_main ; X_aux^(1) ; ... ; X_aux^(K)]`
+
+If each block has length `L`, then:
+
+`X_cat in R^(B x ((2 + K)L) x d_in)`
+
+Step 7. Add embeddings.
+
+ECC then forms:
+
+`emb_x = UpProj(X_cat)` if needed
+
+`H_ECC^(0) = emb_x + PosEmb + CopyEmb + TimeEmb`
+
+where:
+
+- `PosEmb` repeats the same positions across blocks
+- `CopyEmb` tells the model whether a token belongs to:
+  - source block
+  - main block
+  - aux block 1
+  - ...
+- `TimeEmb` is added to every position as usual
+
+Step 8. Explicit ECC attention mask.
+
+ECC builds an explicit attention mask so only valid positions in each block are
+active:
+
+- source block valid where `m_src = 1`
+- main block valid where `m_trg = 1`
+- aux blocks valid where `m_trg = 1`
+
+This differs from the baseline path, which does not pass an explicit attention
+mask to the BERT encoder.
+
+Step 9. Transformer stack.
+
+For every layer:
+
+`H_ECC^(l+1) = TransformerLayer_l(H_ECC^(l), M_ECC)`
+
+Crucial point:
+
+- the full multi-block sequence passes through all layers
+- source/main/aux are all present in every layer
+- the model does not collapse them at layer 1
+- the model does not collapse them inside each layer
+
+Each layer can mix information across blocks through self-attention. For
+example, a main target token can attend to:
+
+- source block tokens
+- main block target tokens
+- auxiliary block target tokens
+
+Step 10. Final readout after the last layer.
+
+After the final encoder layer output:
+
+`H_ECC^(N) in R^(B x ((2 + K)L) x d_model)`
+
+the model slices:
+
+- `H_src  = H_ECC^(N)[:, 0:L, :]`
+- `H_main = H_ECC^(N)[:, L:2L, :]`
+
+Auxiliary output blocks are not returned directly.
+
+Then:
+
+`Y_src = DownProj(H_src)`
+`Y_main = DownProj(H_main)`
+
+Finally, the model collapses back to a single sequence:
+
+`Y = where(m_src, Y_src, Y_main)`
+
+This `Y` is the denoiser output used by diffusion.
+
+This is the exact answer to the collapse question:
+
+- expand before the first layer
+- keep expanded through all layers
+- collapse once after the last layer
+
+
+4. ECC inference flow
+---------------------
+
+Step 1. Initialize main and auxiliary noisy copies.
+
+At decode start:
+
+`x_T_main = where(mask == 0, x_start, noise_main)`
+
+For each auxiliary copy `r`:
+
+`x_aux^(r) = where(mask == 0, x_start, noise_aux^(r))`
+
+Important current ECC implementation detail:
+
+- the main copy evolves across timesteps
+- the auxiliary copies stay fixed during inference
+
+So if the sampler is at timestep `t`, it calls the denoiser with:
+
+- current evolving `x_t_main`
+- fixed `x_aux^(1), ..., x_aux^(K)`
+
+Step 2. At each reverse step, run ECC denoiser.
+
+Given current `x_t_main`, build:
+
+`X_src`
+`X_main`
+`X_aux^(1), ..., X_aux^(K)`
+
+Concatenate:
+
+`X_cat = [X_src ; X_main ; X_aux^(1) ; ... ; X_aux^(K)]`
+
+Build:
+
+`H_ECC^(0) = emb_x + PosEmb + CopyEmb + TimeEmb`
+
+Run through all transformer layers:
+
+`H_ECC^(l+1) = TransformerLayer_l(H_ECC^(l), M_ECC)`
+
+Collapse after final layer:
+
+`hat(x_0)^(t) = where(m_src, Y_src, Y_main)`
+
+Step 3. Reverse diffusion update.
+
+Only the main latent is updated:
+
+`x_(t-1)_main = PosteriorSample(x_t_main, hat(x_0)^(t))`
+
+Then re-anchor source:
+
+`x_(t-1)_main = where(mask == 0, x_start, x_(t-1)_main)`
+
+Auxiliary copies remain unchanged:
+
+`x_aux^(r) <- x_aux^(r)`
+
+Step 4. Final decoding.
+
+After final reverse step, decode the final main latent to vocab logits and
+tokens exactly as in baseline.
+
+
+5. What ECC layers should look like in a diagram
+------------------------------------------------
+
+A detailed ECC diagram should show:
+
+1. Main latent:
+   `x_t_main`
+2. Auxiliary latent copies:
+   `x_aux^(1), ..., x_aux^(K)`
+3. Source/target masking:
+   - source extracted from main
+   - target extracted from main
+   - target extracted from aux copies
+4. Block construction:
+   `X_src`, `X_main`, `X_aux^(1)`, ...
+5. Concatenation into one super-sequence
+6. Addition of:
+   - position embeddings
+   - timestep embeddings
+   - copy embeddings
+7. Explicit ECC attention mask
+8. Repeated transformer layers over the whole concatenated sequence
+9. Final block slicing:
+   - source block output
+   - main block output
+10. Final collapse:
+   `where(source_mask, source_output, main_output)`
+11. Posterior update of main latent only
+12. Aux copies carried unchanged to next iteration
+
+
+Part III. What Happens Inside One Transformer Layer
+===================================================
+
+This section applies to both baseline and ECC. The difference is only what
+hidden-state matrix enters the layer and what attention mask is used.
+
+1. Input to one layer
+---------------------
+
+Suppose layer `l` receives:
+
+`H^(l) in R^(B x S x d_model)`
+
+where:
+
+- `S = L` in baseline
+- `S = (2 + K)L` in ECC
+
+Each row `h_i^(l)` is the representation of one position in the current
+sequence seen by the layer.
+
+
+2. Per-head projections
+-----------------------
+
+For each head `m`, the layer learns matrices:
+
+- `W_m^Q`
+- `W_m^K`
+- `W_m^V`
+
+Then:
+
+`Q_m = H^(l) W_m^Q`
+`K_m = H^(l) W_m^K`
+`V_m = H^(l) W_m^V`
+
+Interpretation:
+
+- `Q` asks: what information does this position want?
+- `K` says: what kind of query would match this position?
+- `V` carries the actual content this position can contribute
+
+
+3. Attention scores
+-------------------
+
+For head `m`:
+
+`Scores_m = (Q_m K_m^T) / sqrt(d_k) + M`
+
+where `M` is the attention mask term.
+
+Then:
+
+`A_m = softmax(Scores_m)`
+
+Each entry `A_m[i, j]` says how much position `i` listens to position `j`.
+
+
+4. Head output
+--------------
+
+`head_m = A_m V_m`
+
+Then concatenate all heads:
+
+`Z = Concat(head_1, ..., head_M) W^O`
+
+
+5. Residual and feed-forward
+----------------------------
+
+First residual update:
+
+`U = LayerNorm(H^(l) + Dropout(Z))`
+
+Feed-forward network:
+
+`F = W_2 GELU(W_1 U + b_1) + b_2`
+
+Second residual update:
+
+`H^(l+1) = LayerNorm(U + Dropout(F))`
+
+That completes one transformer layer.
+
+
+6. What changes across layers?
+------------------------------
+
+The layer structure itself is the same in every layer.
+
+What changes from layer to layer:
+
+- the hidden states `H^(l)`
+- therefore the queries, keys, and values
+- therefore who attends to whom
+
+So when people say "the model gets more abstract in deeper layers," they mean:
+
+- layer 1 attends mostly from the initial embedding-based representation
+- later layers attend from already contextualized representations
+
+In ECC this means:
+
+- in early layers, main tokens may begin reading from source/aux blocks
+- in deeper layers, these already-mixed representations can be refined further
+- the cross-block interaction can happen in all layers because all layers see
+  the full expanded ECC super-sequence
+
+
+Part IV. Exact Answer to the "Collapse" Question
+================================================
+
+Baseline:
+
+- There is no aux/main collapse issue because baseline has only one denoiser
+  sequence.
+
+ECC:
+
+- The model creates separate source/main/aux blocks before layer 1.
+- These blocks remain separate positions in the hidden-state tensor for the
+  entire transformer stack.
+- Every layer processes the expanded tensor.
+- Interaction across copies happens inside attention at every layer.
+- Collapse back to one denoiser output happens only once, after the last
+  encoder layer, by selecting source output from the source block and target
+  output from the main block.
+
+Therefore:
+
+- not first layer
+- not all layers
+- final readout after the last layer
+
+
+Part V. Prompt-Ready Diagram Instructions
+=========================================
+
+If you want another AI to draw full detailed schemes, use the following design
+requirements.
+
+For the baseline diagram:
+
+- Show packed sequence `[src][SEP][trg]`.
+- Show source-target diffusion mask.
+- Show `x_t` in latent space `R^(L x 128)`.
+- Show up-projection to `R^(L x 768)`.
+- Show addition of positional embedding and timestep embedding.
+- Show a stack of 12 repeated BERT encoder layers.
+- Inside one encoder layer, show:
+  - Q/K/V projections per head
+  - scaled dot-product attention
+  - multi-head concatenation and output projection
+  - residual + layer norm
+  - feed-forward MLP
+  - residual + layer norm
+- Show output down-projection back to `R^(L x 128)`.
+- Label output as denoised latent `hat(x_0)`.
+- Show posterior update `hat(x_0), x_t -> x_(t-1)`.
+- Show final LM head over full vocabulary and argmax token decoding.
+
+For the ECC diagram:
+
+- Show current main latent and fixed auxiliary noisy copies as separate inputs.
+- Show source/target masking for each copy.
+- Show block creation:
+  - source block from main
+  - main target block
+  - one or more aux target blocks
+- Show concatenation into one long super-sequence.
+- Show position embeddings, timestep embeddings, and copy embeddings.
+- Show explicit ECC attention mask.
+- Show repeated transformer layers over the full concatenated sequence.
+- Inside each layer, show that main block queries can attend to:
+  - source block keys/values
+  - main block keys/values
+  - aux block keys/values
+- Show that this interaction exists at all layers.
+- Show that no collapse happens inside intermediate layers.
+- Show final slicing after the last layer:
+  - source output block
+  - main output block
+- Show final collapse:
+  `output = where(source_mask, source_output, main_output)`
+- Show that only the main copy is updated to `x_(t-1)`.
+- Show that auxiliary copies remain fixed across reverse steps.
+
+
+Part VI. Minimal Core Equations Summary
+=======================================
+
+Baseline input to transformer:
+
+`H_baseline^(0) = UpProj(x_t) + PosEmb + TimeEmb`
+
+Baseline layer recurrence:
+
+`H_baseline^(l+1) = TransformerLayer_l(H_baseline^(l))`
+
+Baseline output:
+
+`hat(x_0) = DownProj(H_baseline^(N))`
+
+
+ECC input blocks:
+
+`X_src = m_src * x_t_main`
+`X_main = m_trg * x_t_main`
+`X_aux^(r) = m_trg * x_aux^(r)`
+
+ECC concatenated input:
+
+`X_cat = [X_src ; X_main ; X_aux^(1) ; ... ; X_aux^(K)]`
+
+ECC input to transformer:
+
+`H_ECC^(0) = UpProj(X_cat) + PosEmb + CopyEmb + TimeEmb`
+
+ECC layer recurrence:
+
+`H_ECC^(l+1) = TransformerLayer_l(H_ECC^(l), M_ECC)`
+
+ECC final readout:
+
+`Y_src = DownProj(H_ECC^(N)[src_block])`
+`Y_main = DownProj(H_ECC^(N)[main_block])`
+
+ECC collapse:
+
+`hat(x_0) = where(m_src, Y_src, Y_main)`
+
+Reverse diffusion update:
+
+`x_(t-1) = PosteriorSample(x_t, hat(x_0))`
+
+
+Final Takeaway
+==============
+
+The most important conceptual difference is:
+
+- baseline changes only one sequence through the transformer
+- ECC expands the representation into multiple blocks before layer 1, lets all
+  layers reason over them jointly, and collapses back to one output only after
+  the last layer
+
+So if a diagram must emphasize one thing, it should emphasize:
+
+- ECC is "expand early, interact through all layers, collapse late"
+- not "split and merge inside every layer"
