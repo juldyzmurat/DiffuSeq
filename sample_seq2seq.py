@@ -50,25 +50,29 @@ def _sampling_timesteps(diffusion, use_ddim, gap):
     return indices
 
 
-def _decode_target_texts(model, tokenizer, latent, input_ids_mask_ori, seq_len):
-    logits = model.get_logits(latent)
-    cands = th.topk(logits, k=1, dim=-1)
-
+def _decode_target_texts(model, tokenizer, latent, input_ids_mask_ori, seq_len, target_len_ori):
     decoded = []
-    for seq, input_mask in zip(cands.indices, input_ids_mask_ori):
-        len_x = seq_len - sum(input_mask).tolist()
-        decoded.append(tokenizer.decode_token(seq[len_x:]))
+    for i, (emb, input_mask) in enumerate(zip(latent, input_ids_mask_ori)):
+        context_len = seq_len - sum(input_mask).tolist()
+        tlen = int(target_len_ori[i])
+        emb1 = emb[context_len:context_len + tlen]
+        emb2 = emb[context_len + tlen:context_len + 2 * tlen]
+        emb_avg = (emb1 + emb2) / 2
+        logits = model.get_logits(emb_avg.unsqueeze(0))
+        cands = th.topk(logits, k=1, dim=-1)
+        decoded.append(tokenizer.decode_token(cands.indices[0, :, 0]))
     return decoded
 
 
-def _decode_source_and_reference(tokenizer, input_ids_x, input_ids_mask_ori, seq_len):
+def _decode_source_and_reference(tokenizer, input_ids_x, input_ids_mask_ori, seq_len, target_len_ori):
     sources = []
     references = []
 
-    for seq, input_mask in zip(input_ids_x, input_ids_mask_ori):
-        len_x = seq_len - sum(input_mask).tolist()
-        sources.append(tokenizer.decode_token(seq[:len_x]))
-        references.append(tokenizer.decode_token(seq[len_x:]))
+    for i, (seq, input_mask) in enumerate(zip(input_ids_x, input_ids_mask_ori)):
+        context_len = seq_len - sum(input_mask).tolist()
+        tlen = int(target_len_ori[i])
+        sources.append(tokenizer.decode_token(seq[:context_len]))
+        references.append(tokenizer.decode_token(seq[context_len:context_len + tlen]))
 
     return sources, references
 
@@ -183,6 +187,7 @@ def main():
         x_start = model.get_embeds(input_ids_x)
         input_ids_mask_ori = cond.pop('input_mask')
         input_ids_mask_dev = input_ids_mask_ori.to(dist_util.dev())
+        target_len_ori = cond.pop('target_len')
 
         noise_main = th.randn_like(x_start)
         input_ids_mask = th.broadcast_to(input_ids_mask_dev.unsqueeze(dim=-1), x_start.shape)
@@ -246,6 +251,7 @@ def main():
                     step_out["pred_xstart"],
                     input_ids_mask_ori,
                     args.seq_len,
+                    target_len_ori,
                 )
                 for example_idx, recover_text in enumerate(decoded_step):
                     stepwise_recoveries[example_idx].append(
@@ -265,12 +271,14 @@ def main():
             final_sample,
             input_ids_mask_ori,
             args.seq_len,
+            target_len_ori,
         )
         word_lst_source, word_lst_ref = _decode_source_and_reference(
             tokenizer,
             input_ids_x,
             input_ids_mask_ori,
             args.seq_len,
+            target_len_ori,
         )
 
         for i in range(world_size):

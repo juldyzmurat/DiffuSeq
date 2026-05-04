@@ -14,7 +14,7 @@ if __name__ == '__main__':
     parser.add_argument('--diff_steps', type=int, default=4000, help='diffusion steps')
     parser.add_argument('--schedule_sampler', type=str, default='uniform', choices=['uniform', 'lossaware', 'fixstep'], help='schedule sampler of timesteps')
 
-    parser.add_argument('--seq_len', type=int, default=128, help='max len of input sequence')
+    parser.add_argument('--seq_len', type=int, default=192, help='max len of input sequence')
     parser.add_argument('--hidden_t_dim', type=int, default=128, help='hidden size of time embedding')
     parser.add_argument('--hidden_dim', type=int, default=128, help='hidden size of word embedding')
     parser.add_argument('--learning_steps', type=int, default=40000, help='total steps of learning')

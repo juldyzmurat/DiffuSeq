@@ -104,11 +104,12 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
     def merge_and_mask(group_lst):
         lst = []
         mask = []
+        target_lens = []
         for i in range(len(group_lst['input_id_x'])):
             end_token = group_lst['input_id_x'][i][-1]
             src = group_lst['input_id_x'][i][:-1]
             trg = group_lst['input_id_y'][i][:-1]
-            while len(src) + len(trg) > seq_len - 3:
+            while len(src) + 2*len(trg) > seq_len - 3:
                 if len(src)>len(trg):
                     src.pop()
                 elif len(src)<len(trg):
@@ -119,10 +120,12 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
             src.append(end_token)
             trg.append(end_token)
 
-            lst.append(src + [vocab_dict.sep_token_id] + trg)
+            lst.append(src + [vocab_dict.sep_token_id] + trg + trg)
             mask.append([0]*(len(src)+1))
+            target_lens.append(len(trg))
         group_lst['input_ids'] = lst
         group_lst['input_mask'] = mask
+        group_lst['target_len'] = target_lens
         return group_lst
     
     tokenized_datasets = tokenized_datasets.map(
@@ -212,6 +215,7 @@ class TextDataset(Dataset):
             out_kwargs = {}
             out_kwargs['input_ids'] = np.array(self.text_datasets['train'][idx]['input_ids'])
             out_kwargs['input_mask'] = np.array(self.text_datasets['train'][idx]['input_mask'])
+            out_kwargs['target_len'] = np.array(self.text_datasets['train'][idx]['target_len'])
 
             return arr, out_kwargs
 

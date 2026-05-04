@@ -597,6 +597,7 @@ class GaussianDiffusion:
         assert 'input_ids' in model_kwargs
         input_ids_x = model_kwargs.pop('input_ids').to(t.device)
         input_ids_mask = model_kwargs.pop('input_mask').to(t.device)
+        target_len = model_kwargs.pop('target_len').to(t.device)  # [B]
         x_start_mean = model.model.module.get_embeds(input_ids_x)
         
         std = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod,
@@ -615,24 +616,49 @@ class GaussianDiffusion:
 
         terms = {}
 
-        target = x_start
         model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
-        assert model_output.shape == target.shape == x_start.shape
-        terms["mse"] = mean_flat((target - model_output) ** 2)
+        assert model_output.shape == x_start.shape
 
-        model_out_x_start = self._x0_helper(model_output, x_t, t)['pred_xstart'] # predicted_xstart = model_output
+        # build per-position boolean masks for target1 and target2
+        context_len = (input_ids_mask == 0).sum(dim=-1)  # [B]
+        B, S, D = model_output.shape
+        positions = th.arange(S, device=model_output.device).unsqueeze(0).expand(B, -1)  # [B, S]
+        cl = context_len.unsqueeze(1)  # [B, 1]
+        tl = target_len.unsqueeze(1)   # [B, 1]
+        t1_mask = (positions >= cl) & (positions < cl + tl)           # [B, S]
+        t2_mask = (positions >= cl + tl) & (positions < cl + 2 * tl)  # [B, S]
+        t1_mask_d = t1_mask.unsqueeze(-1).expand(-1, -1, D)            # [B, S, D]
+
+        # align target2 to target1 positions via gather (clamp keeps indices in bounds)
+        gather_idx = (positions + tl).clamp(0, S - 1).unsqueeze(-1).expand(-1, -1, D)
+        shifted_output = th.gather(model_output, 1, gather_idx)
+
+        # averaged output at target1 positions; elsewhere unchanged
+        out_avg = th.where(t1_mask_d, (model_output + shifted_output) / 2, model_output)
+
+        # MSE: averaged over target1 positions only
+        t1_count = t1_mask_d.float().sum(dim=(1, 2)).clamp(min=1)
+        terms["mse"] = ((x_start - out_avg) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
+
+        model_out_x_start = self._x0_helper(model_output, x_t, t)['pred_xstart']
+        shifted_x_start_out = th.gather(model_out_x_start, 1, gather_idx)
+        out_avg_x_start = th.where(t1_mask_d, (model_out_x_start + shifted_x_start_out) / 2, model_out_x_start)
+        t0_loss = ((x_start_mean - out_avg_x_start) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
         t0_mask = (t == 0)
-        t0_loss = mean_flat((x_start_mean - model_out_x_start) ** 2)
         terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
 
-        # tT_mask = (t == self.num_timesteps - 1)
         out_mean, _, _ = self.q_mean_variance(x_start, th.LongTensor([self.num_timesteps - 1]).to(x_start.device))
-        tT_loss =  mean_flat(out_mean ** 2)
+        tT_loss = mean_flat(out_mean ** 2)
 
-        decoder_nll = self._token_discrete_loss(x_start, get_logits, input_ids_x) # embedding regularization
-        terms["nll"] = self._token_discrete_loss(model_out_x_start, get_logits, input_ids_x, mask=input_ids_mask, truncate=True, t=t) # x_0->model_out_x_start
-        # assert (model.lm_head.weight == model.word_embedding.weight).all()
+        # decoder_nll: pass full sequence with t1/t2 masks; _token_discrete_loss handles averaging
+        nll1 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t1_mask.float())
+        nll2 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t2_mask.float())
+        decoder_nll = (nll1 + nll2) / 2
 
+        terms["nll"] = self._token_discrete_loss(out_avg, get_logits, input_ids_x, mask=t1_mask.float(), truncate=True, t=t)
+
+        terms["decoder_nll"] = decoder_nll
+        terms["tT_loss"] = tT_loss
         terms["loss"] = terms["mse"] + decoder_nll + tT_loss
 
         return terms
