@@ -15,6 +15,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--top_p', type=int, default=-1, help='top p used in sampling, default is off')
     parser.add_argument('--pattern', type=str, default='ema', help='training pattern')
+    parser.add_argument('--resample_strategy', type=str, default='noise_adaptive', help='resampling strategy: none, fixed, uniform, noise_adaptive')
+    parser.add_argument('--resample_freq', type=int, default=100, help='resample every N steps (fixed/uniform)')
+    parser.add_argument('--resample_threshold', type=float, default=0.5, help='noise level threshold for noise_adaptive resampling')
     
     args = parser.parse_args()
 
@@ -38,7 +41,8 @@ if __name__ == '__main__':
             COMMAND = f'python -m torch.distributed.launch --nproc_per_node=1 --master_port={12233 + int(args.seed)} --use_env sample_seq2seq.py ' \
             f'--model_path {checkpoint_one} --step {args.step} ' \
             f'--batch_size {args.bsz} --seed2 {args.seed} --split {args.split} ' \
-            f'--out_dir {out_dir} --top_p {args.top_p} '
+            f'--out_dir {out_dir} --top_p {args.top_p} ' \
+            f'--resample_strategy {args.resample_strategy} --resample_freq {args.resample_freq} --resample_threshold {args.resample_threshold} '
             print(COMMAND)
             
             os.system(COMMAND)
