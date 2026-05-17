@@ -478,6 +478,10 @@ class GaussianDiffusion:
         clamp_first=None,
         mask=None,
         x_start=None,
+        resample_strategy=None,
+        resample_freq=100,
+        resample_threshold=0.5,
+        target_len=None,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -486,6 +490,11 @@ class GaussianDiffusion:
         Arguments are the same as p_sample_loop().
         Returns a generator over dicts, where each dict is the return value of
         p_sample().
+
+        :param resample_strategy: one of None, "fixed", "uniform", "noise_adaptive".
+        :param resample_freq: for "fixed"/"uniform", resample every this many steps.
+        :param resample_threshold: for "noise_adaptive", resample when noise level < this.
+        :param target_len: [B] int tensor with the length of one target copy per sample.
         """
         if device is None:
             device = next(model.parameters()).device
@@ -525,6 +534,50 @@ class GaussianDiffusion:
                     mask=mask,
                     x_start=x_start
                 )
+
+                # particle resampling: kill outlier copy, clone a top-2 copy
+                if resample_strategy is not None and target_len is not None and mask is not None and i > 0:
+                    do_resample = False
+                    if resample_strategy == "fixed":
+                        do_resample = (i % resample_freq == 0)
+                    elif resample_strategy == "uniform":
+                        do_resample = (i % resample_freq == 0)
+                    elif resample_strategy == "noise_adaptive":
+                        do_resample = float(self.sqrt_one_minus_alphas_cumprod[i]) < resample_threshold
+
+                    if do_resample:
+                        pred = out["pred_xstart"]               # [B, S, D]
+                        tl_r = target_len.to(pred.device).long()
+                        ctx_len = (mask[:, :, 0] == 0).sum(dim=-1).long()  # [B]
+                        new_sample = out["sample"].clone()
+                        B_r = pred.shape[0]
+                        for b in range(B_r):
+                            cl_b = int(ctx_len[b])
+                            tl_b = int(tl_r[b])
+                            if tl_b == 0:
+                                continue
+                            e1 = pred[b, cl_b:cl_b + tl_b]
+                            e2 = pred[b, cl_b + tl_b:cl_b + 2 * tl_b]
+                            e3 = pred[b, cl_b + 2 * tl_b:cl_b + 3 * tl_b]
+                            copies_b = [e1, e2, e3]
+                            # sum of pairwise L2 distances for each copy
+                            scores = [
+                                sum(
+                                    th.norm(copies_b[ci].float() - copies_b[cj].float())
+                                    for cj in range(3) if cj != ci
+                                )
+                                for ci in range(3)
+                            ]
+                            outlier_idx = int(th.tensor(scores).argmax())
+                            top2 = [j for j in range(3) if j != outlier_idx]
+                            clone_src = top2[th.randint(0, 2, (1,)).item()]
+                            src_start = cl_b + clone_src * tl_b
+                            dst_start = cl_b + outlier_idx * tl_b
+                            good_mean = out["greedy_mean"][b, src_start:src_start + tl_b]
+                            sigma = th.exp(0.5 * out["out"]["log_variance"][b, dst_start:dst_start + tl_b])
+                            new_sample[b, dst_start:dst_start + tl_b] = good_mean + sigma * th.randn_like(sigma)
+                        out = {**out, "sample": new_sample}
+
                 yield out
                 sample_x = out["sample"]
 
@@ -619,30 +672,49 @@ class GaussianDiffusion:
         model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
         assert model_output.shape == x_start.shape
 
-        # build per-position boolean masks for target1 and target2
+        # build per-position boolean masks for target1, target2, target3
         context_len = (input_ids_mask == 0).sum(dim=-1)  # [B]
         B, S, D = model_output.shape
         positions = th.arange(S, device=model_output.device).unsqueeze(0).expand(B, -1)  # [B, S]
         cl = context_len.unsqueeze(1)  # [B, 1]
         tl = target_len.unsqueeze(1)   # [B, 1]
-        t1_mask = (positions >= cl) & (positions < cl + tl)           # [B, S]
-        t2_mask = (positions >= cl + tl) & (positions < cl + 2 * tl)  # [B, S]
-        t1_mask_d = t1_mask.unsqueeze(-1).expand(-1, -1, D)            # [B, S, D]
+        t1_mask = (positions >= cl) & (positions < cl + tl)                   # [B, S]
+        t2_mask = (positions >= cl + tl) & (positions < cl + 2 * tl)          # [B, S]
+        t3_mask = (positions >= cl + 2 * tl) & (positions < cl + 3 * tl)      # [B, S]
+        t1_mask_d = t1_mask.unsqueeze(-1).expand(-1, -1, D)                   # [B, S, D]
 
-        # align target2 to target1 positions via gather (clamp keeps indices in bounds)
-        gather_idx = (positions + tl).clamp(0, S - 1).unsqueeze(-1).expand(-1, -1, D)
-        shifted_output = th.gather(model_output, 1, gather_idx)
+        # align target2 and target3 to target1 positions via gather
+        gather_idx2 = (positions + tl).clamp(0, S - 1).unsqueeze(-1).expand(-1, -1, D)
+        gather_idx3 = (positions + 2 * tl).clamp(0, S - 1).unsqueeze(-1).expand(-1, -1, D)
+        out_t2_aligned = th.gather(model_output, 1, gather_idx2)
+        out_t3_aligned = th.gather(model_output, 1, gather_idx3)
 
-        # averaged output at target1 positions; elsewhere unchanged
-        out_avg = th.where(t1_mask_d, (model_output + shifted_output) / 2, model_output)
-
-        # MSE: averaged over target1 positions only
+        # per-copy MSE at t1 positions, detached for selection only
         t1_count = t1_mask_d.float().sum(dim=(1, 2)).clamp(min=1)
+        mse_t1 = ((x_start - model_output) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)).detach() / t1_count
+        mse_t2 = ((x_start - out_t2_aligned) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)).detach() / t1_count
+        mse_t3 = ((x_start - out_t3_aligned) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)).detach() / t1_count
+
+        # select best 2 copies per sample; indices used for both MSE and NLL
+        mse_stack = th.stack([mse_t1, mse_t2, mse_t3], dim=1)          # [B, 3]
+        _, best2_idx = mse_stack.topk(k=2, dim=1, largest=False)        # [B, 2]
+
+        # build best-2 averaged output at t1 positions
+        copies = th.stack([model_output, out_t2_aligned, out_t3_aligned], dim=1)  # [B, 3, S, D]
+        gather_copies = best2_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, S, D)
+        selected = copies.gather(1, gather_copies)                       # [B, 2, S, D]
+        out_avg = th.where(t1_mask_d, selected.mean(dim=1), model_output)
+
+        # MSE on best-2 average
         terms["mse"] = ((x_start - out_avg) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
 
+        # t0_loss: same best-2 selection on pred_xstart
         model_out_x_start = self._x0_helper(model_output, x_t, t)['pred_xstart']
-        shifted_x_start_out = th.gather(model_out_x_start, 1, gather_idx)
-        out_avg_x_start = th.where(t1_mask_d, (model_out_x_start + shifted_x_start_out) / 2, model_out_x_start)
+        xs_t2_aligned = th.gather(model_out_x_start, 1, gather_idx2)
+        xs_t3_aligned = th.gather(model_out_x_start, 1, gather_idx3)
+        xs_copies = th.stack([model_out_x_start, xs_t2_aligned, xs_t3_aligned], dim=1)
+        xs_selected = xs_copies.gather(1, gather_copies)
+        out_avg_x_start = th.where(t1_mask_d, xs_selected.mean(dim=1), model_out_x_start)
         t0_loss = ((x_start_mean - out_avg_x_start) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
         t0_mask = (t == 0)
         terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
@@ -650,10 +722,12 @@ class GaussianDiffusion:
         out_mean, _, _ = self.q_mean_variance(x_start, th.LongTensor([self.num_timesteps - 1]).to(x_start.device))
         tT_loss = mean_flat(out_mean ** 2)
 
-        # decoder_nll: pass full sequence with t1/t2 masks; _token_discrete_loss handles averaging
+        # decoder_nll: compute for all 3 copies, select best-2 using same best2_idx
         nll1 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t1_mask.float())
         nll2 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t2_mask.float())
-        decoder_nll = (nll1 + nll2) / 2
+        nll3 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t3_mask.float())
+        nll_stack = th.stack([nll1, nll2, nll3], dim=1)                 # [B, 3]
+        decoder_nll = nll_stack.gather(1, best2_idx).mean(dim=1)        # [B]
 
         terms["nll"] = self._token_discrete_loss(out_avg, get_logits, input_ids_x, mask=t1_mask.float(), truncate=True, t=t)
 

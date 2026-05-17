@@ -109,7 +109,7 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
             end_token = group_lst['input_id_x'][i][-1]
             src = group_lst['input_id_x'][i][:-1]
             trg = group_lst['input_id_y'][i][:-1]
-            while len(src) + 2*len(trg) > seq_len - 3:
+            while len(src) + 3*len(trg) > seq_len - 3:
                 if len(src)>len(trg):
                     src.pop()
                 elif len(src)<len(trg):
@@ -120,7 +120,7 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
             src.append(end_token)
             trg.append(end_token)
 
-            lst.append(src + [vocab_dict.sep_token_id] + trg + trg)
+            lst.append(src + [vocab_dict.sep_token_id] + trg + trg + trg)
             mask.append([0]*(len(src)+1))
             target_lens.append(len(trg))
         group_lst['input_ids'] = lst

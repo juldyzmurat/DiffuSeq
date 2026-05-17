@@ -35,6 +35,9 @@ def create_argparser():
         seed2=105,
         clip_denoised=False,
         save_intermediate=True,
+        resample_strategy='noise_adaptive',
+        resample_freq=100,
+        resample_threshold=0.5,
     )
     defaults.update(load_defaults_config())
     defaults.update(decode_defaults)
@@ -57,7 +60,18 @@ def _decode_target_texts(model, tokenizer, latent, input_ids_mask_ori, seq_len, 
         tlen = int(target_len_ori[i])
         emb1 = emb[context_len:context_len + tlen]
         emb2 = emb[context_len + tlen:context_len + 2 * tlen]
-        emb_avg = (emb1 + emb2) / 2
+        emb3 = emb[context_len + 2 * tlen:context_len + 3 * tlen]
+        copies = [emb1, emb2, emb3]
+        # identify outlier: highest sum of pairwise L2 distances to the other two
+        scores = [
+            sum(th.norm(copies[ci].float() - copies[cj].float()) for cj in range(3) if cj != ci)
+            for ci in range(3)
+        ]
+        outlier_idx = int(th.tensor(scores).argmax())
+        top2 = [j for j in range(3) if j != outlier_idx]
+        clone_src = top2[th.randint(0, 2, (1,)).item()]
+        copies[outlier_idx] = copies[clone_src]
+        emb_avg = sum(copies) / 3
         logits = model.get_logits(emb_avg.unsqueeze(0))
         cands = th.topk(logits, k=1, dim=-1)
         decoded.append(tokenizer.decode_token(cands.indices[0, :, 0]))
@@ -236,6 +250,13 @@ def main():
             progressive_kwargs["top_p"] = args.top_p
             progressive_kwargs["clamp_step"] = args.clamp_step
             progressive_kwargs["clamp_first"] = True
+            resample_strat = args.resample_strategy if args.resample_strategy != 'none' else None
+            progressive_kwargs["resample_strategy"] = resample_strat
+            progressive_kwargs["resample_freq"] = args.resample_freq
+            progressive_kwargs["resample_threshold"] = args.resample_threshold
+            progressive_kwargs["target_len"] = th.tensor(
+                [int(x) for x in target_len_ori], device=dist_util.dev()
+            )
 
         stepwise_recoveries = [[] for _ in range(x_start.shape[0])]
         final_sample = None
