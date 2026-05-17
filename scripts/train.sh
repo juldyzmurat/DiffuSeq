@@ -3,11 +3,12 @@ CUDA_VISIBLE_DEVICES=0,3 python -m torch.distributed.launch --nproc_per_node=2 -
 --diff_steps 2000 \
 --lr 0.0001 \
 --learning_steps 10000 \
---save_interval 1000 \
+--save_interval 500 \
 --seed 102 \
 --noise_schedule sqrt \
 --hidden_dim 128 \
 --bsz 2048 \
+--microbatch 32 \
 --dataset qqp \
 --data_dir datasets/QQP \
 --vocab bert \
