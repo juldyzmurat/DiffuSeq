@@ -722,10 +722,10 @@ class GaussianDiffusion:
         out_mean, _, _ = self.q_mean_variance(x_start, th.LongTensor([self.num_timesteps - 1]).to(x_start.device))
         tT_loss = mean_flat(out_mean ** 2)
 
-        # decoder_nll: compute for all 3 copies, select best-2 using same best2_idx
-        nll1 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t1_mask.float())
-        nll2 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t2_mask.float())
-        nll3 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t3_mask.float())
+        # decoder_nll: use predicted x_0 per copy, select best-2 with same best2_idx as MSE
+        nll1 = self._token_discrete_loss(model_out_x_start, get_logits, input_ids_x, mask=t1_mask.float())
+        nll2 = self._token_discrete_loss(xs_t2_aligned,     get_logits, input_ids_x, mask=t1_mask.float())
+        nll3 = self._token_discrete_loss(xs_t3_aligned,     get_logits, input_ids_x, mask=t1_mask.float())
         nll_stack = th.stack([nll1, nll2, nll3], dim=1)                 # [B, 3]
         decoder_nll = nll_stack.gather(1, best2_idx).mean(dim=1)        # [B]
 

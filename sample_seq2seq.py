@@ -55,26 +55,18 @@ def _sampling_timesteps(diffusion, use_ddim, gap):
 
 def _decode_target_texts(model, tokenizer, latent, input_ids_mask_ori, seq_len, target_len_ori):
     decoded = []
-    for i, (emb, input_mask) in enumerate(zip(latent, input_ids_mask_ori)):
-        context_len = seq_len - sum(input_mask).tolist()
-        tlen = int(target_len_ori[i])
-        emb1 = emb[context_len:context_len + tlen]
-        emb2 = emb[context_len + tlen:context_len + 2 * tlen]
-        emb3 = emb[context_len + 2 * tlen:context_len + 3 * tlen]
-        copies = [emb1, emb2, emb3]
-        # identify outlier: highest sum of pairwise L2 distances to the other two
-        scores = [
-            sum(th.norm(copies[ci].float() - copies[cj].float()) for cj in range(3) if cj != ci)
-            for ci in range(3)
-        ]
-        outlier_idx = int(th.tensor(scores).argmax())
-        top2 = [j for j in range(3) if j != outlier_idx]
-        clone_src = top2[th.randint(0, 2, (1,)).item()]
-        copies[outlier_idx] = copies[clone_src]
-        emb_avg = sum(copies) / 3
-        logits = model.get_logits(emb_avg.unsqueeze(0))
-        cands = th.topk(logits, k=1, dim=-1)
-        decoded.append(tokenizer.decode_token(cands.indices[0, :, 0]))
+    for b, (lat, input_mask, tl) in enumerate(zip(latent, input_ids_mask_ori, target_len_ori)):
+        cl = seq_len - sum(input_mask).item()  # start of target region
+        tl = int(tl)
+        copy1 = lat[cl        : cl +     tl]
+        copy2 = lat[cl + tl   : cl + 2 * tl]
+        copy3 = lat[cl + 2*tl : cl + 3 * tl]
+        averaged = (copy1 + copy2 + copy3) / 3  # average in embedding space
+        lat_avg = lat.clone()
+        lat_avg[cl : cl + tl] = averaged
+        logits = model.get_logits(lat_avg.unsqueeze(0))
+        cands = th.topk(logits[0, cl : cl + tl], k=1, dim=-1)
+        decoded.append(tokenizer.decode_token(cands.indices.squeeze(-1)))
     return decoded
 
 
