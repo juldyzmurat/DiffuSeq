@@ -705,8 +705,13 @@ class GaussianDiffusion:
         selected = copies.gather(1, gather_copies)                       # [B, 2, S, D]
         out_avg = th.where(t1_mask_d, selected.mean(dim=1), model_output)
 
-        # MSE on best-2 average
         terms["mse"] = ((x_start - out_avg) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
+        # the worst copy toward x_start, with a small weight
+        worst_idx = mse_stack.topk(k=1, dim=1, largest=True).indices  # [B, 1]
+        worst_gather = worst_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, S, D)
+        worst = copies.gather(1, worst_gather).squeeze(1)  # [B, S, D]
+        mse_worst = ((x_start - worst) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
+        terms["mse"] = terms["mse"] + 0.1 * mse_worst
 
         # t0_loss: same best-2 selection on pred_xstart
         model_out_x_start = self._x0_helper(model_output, x_t, t)['pred_xstart']
@@ -716,18 +721,21 @@ class GaussianDiffusion:
         xs_selected = xs_copies.gather(1, gather_copies)
         out_avg_x_start = th.where(t1_mask_d, xs_selected.mean(dim=1), model_out_x_start)
         t0_loss = ((x_start_mean - out_avg_x_start) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
+        xs_worst = xs_copies.gather(1, worst_gather).squeeze(1)
+        mse_worst_x_start = ((x_start_mean - xs_worst) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
+        t0_loss = t0_loss + 0.1 * mse_worst_x_start
         t0_mask = (t == 0)
         terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
 
         out_mean, _, _ = self.q_mean_variance(x_start, th.LongTensor([self.num_timesteps - 1]).to(x_start.device))
         tT_loss = mean_flat(out_mean ** 2)
 
-        # decoder_nll: use predicted x_0 per copy, select best-2 with same best2_idx as MSE
-        nll1 = self._token_discrete_loss(model_out_x_start, get_logits, input_ids_x, mask=t1_mask.float())
-        nll2 = self._token_discrete_loss(xs_t2_aligned,     get_logits, input_ids_x, mask=t1_mask.float())
-        nll3 = self._token_discrete_loss(xs_t3_aligned,     get_logits, input_ids_x, mask=t1_mask.float())
+        # decoder_nll: compute for all 3 copies, select best-2 using same best2_idx
+        nll1 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t1_mask.float())
+        nll2 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t2_mask.float())
+        nll3 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t3_mask.float())
         nll_stack = th.stack([nll1, nll2, nll3], dim=1)                 # [B, 3]
-        decoder_nll = nll_stack.gather(1, best2_idx).mean(dim=1)        # [B]
+        decoder_nll = nll_stack.gather(1, best2_idx).mean(dim=1)
 
         terms["nll"] = self._token_discrete_loss(out_avg, get_logits, input_ids_x, mask=t1_mask.float(), truncate=True, t=t)
 
