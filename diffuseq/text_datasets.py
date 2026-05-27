@@ -109,7 +109,7 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
             end_token = group_lst['input_id_x'][i][-1]
             src = group_lst['input_id_x'][i][:-1]
             trg = group_lst['input_id_y'][i][:-1]
-            while len(src) + 3*len(trg) > seq_len - 3:
+            while len(src) + 3*len(trg) > seq_len - 5:
                 if len(src)>len(trg):
                     src.pop()
                 elif len(src)<len(trg):
@@ -135,7 +135,7 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
         desc=f"merge and mask",
     )
     
-    def pad_function(group_lst):
+    """"def pad_function(group_lst):
         max_length = seq_len
         group_lst['input_ids'] = _collate_batch_helper(group_lst['input_ids'], vocab_dict.pad_token_id, max_length)
         group_lst['input_mask'] = _collate_batch_helper(group_lst['input_mask'], 1, max_length)
@@ -156,6 +156,26 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
     raw_datasets = datasets.DatasetDict()
     raw_datasets['train'] = lm_datasets
     print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+    return raw_datasets"""
+    print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+
+    input_ids = tokenized_datasets['input_ids']
+    input_mask = tokenized_datasets['input_mask']
+
+    padded_ids =   [ids + [vocab_dict.pad_token_id] * (seq_len - len(ids)) for ids in input_ids]
+    padded_mask =  [m   + [1]                        * (seq_len - len(m))   for m   in input_mask]
+
+    lm_datasets = Dataset2.from_dict({
+        'input_ids':  padded_ids,
+        'input_mask': padded_mask,
+        'target_len': tokenized_datasets['target_len'],
+    })
+
+    print(lm_datasets, 'padded dataset')
+    print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+
+    raw_datasets = datasets.DatasetDict()
+    raw_datasets['train'] = lm_datasets
     return raw_datasets
 
 
