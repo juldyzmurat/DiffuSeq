@@ -656,10 +656,16 @@ class GaussianDiffusion:
         tT_loss = mean_flat(out_mean ** 2)
 
         # decoder_nll: average across all three target spans
+        nll_src = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=(input_ids_mask == 0).float())
         nll1 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t1_mask.float())
         nll2 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t2_mask.float())
         nll3 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t3_mask.float())
-        decoder_nll = (nll1 + nll2 + nll3) / 3
+        nll_tgt = (nll1 + nll2 + nll3) / 3
+
+        src_len = (input_ids_mask == 0).sum(dim=-1).float()  # [B]
+        tgt_len = target_len.float()                          # [B]
+        total_len = src_len + tgt_len
+        decoder_nll = (nll_src * src_len + nll_tgt * tgt_len) / total_len
 
         terms["nll"] = self._token_discrete_loss(out_avg, get_logits, input_ids_x, mask=t1_mask.float(), truncate=True, t=t)
 
