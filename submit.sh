@@ -29,7 +29,7 @@ python -m torch.distributed.launch \
   --hidden_dim 128 \
   --bsz 2048 \
   --dataset qqp \
-  --data_dir /lustre/uc3m/gts_c3_cluster_1-12/zualikha/datasets/QQP/ \
+  --data_dir /home/zualikha/DiffuSeq/datasets/QQP/ \
   --vocab bert \
   --seq_len 128 \
   --schedule_sampler lossaware \
