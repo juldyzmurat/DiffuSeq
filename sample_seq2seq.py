@@ -187,6 +187,27 @@ def main():
         noise_main = th.randn_like(x_start)
         input_ids_mask = th.broadcast_to(input_ids_mask_dev.unsqueeze(dim=-1), x_start.shape)
         x_noised = th.where(input_ids_mask == 0, x_start, noise_main)
+        #temp change to test the ability of model to paraphrase regardless of target length 
+        """input_ids_x = cond.pop('input_ids').to(dist_util.dev())
+        input_ids_mask_ori = cond.pop('input_mask')             
+
+        src_lens = (input_ids_mask_ori == 0).sum(dim=1)          
+
+        new_mask = th.ones_like(input_ids_mask_ori)             
+        for b in range(input_ids_mask_ori.shape[0]):
+            new_mask[b, :src_lens[b]] = 0                       
+
+        for b in range(input_ids_mask_ori.shape[0]):
+            input_ids_x[b, src_lens[b]:] = tokenizer.pad_token_id
+
+        x_start = model.get_embeds(input_ids_x)
+        input_ids_mask_ori = new_mask
+        input_ids_mask_dev = new_mask.to(dist_util.dev())
+
+        noise_main = th.randn_like(x_start)
+        input_ids_mask = th.broadcast_to(input_ids_mask_dev.unsqueeze(dim=-1), x_start.shape)
+        x_noised = th.where(input_ids_mask == 0, x_start, noise_main)"""
+        #temp change to test the ability of model to paraphrase regardless of target length 
 
         model_kwargs = {}
         if getattr(model, "ecc_mode", False):
@@ -279,6 +300,36 @@ def main():
                 for (recov, ref, src) in zip(word_lst_recover, word_lst_ref, word_lst_source):
                     print(json.dumps({"recover": recov, "reference": ref, "source": src}), file=fout)
                 fout.close()
+                
+                #version for repeated target for baseline 
+                """chunk_out_path = out_path.replace('.json', '.targets.json')
+                with open(chunk_out_path, 'a') as fchunk:
+                    for i in range(len(word_lst_source)):
+                        src_len_i = (input_ids_mask_ori[i] == 0).sum().item()
+                        target_latent_i = final_sample[i, src_len_i:, :]
+
+                        chunk_len = target_latent_i.shape[0] // 3
+                        chunks_i = [
+                            target_latent_i[:chunk_len, :],
+                            target_latent_i[chunk_len:2*chunk_len, :],
+                            target_latent_i[2*chunk_len:3*chunk_len, :],
+                        ]
+                        avg_chunk_i = th.stack(chunks_i, dim=0).mean(dim=0)
+
+                        def decode_latent_single(chunk):
+                            logits = model.get_logits(chunk.unsqueeze(0))
+                            indices = th.topk(logits, k=1, dim=-1).indices.squeeze()
+                            return tokenizer.decode_token(indices)
+
+                        print(json.dumps({
+                            "source":  word_lst_source[i],
+                            "target1": decode_latent_single(chunks_i[0]),
+                            "target2": decode_latent_single(chunks_i[1]),
+                            "target3": decode_latent_single(chunks_i[2]),
+                            "avg":     decode_latent_single(avg_chunk_i),
+                        }), file=fchunk)"""
+                #version for repeated target for baseline 
+
 
                 if args.save_intermediate:
                     fout_intermediate = open(intermediate_out_path, 'a')

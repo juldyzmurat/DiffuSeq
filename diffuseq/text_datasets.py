@@ -8,6 +8,7 @@ import json
 import psutil
 import datasets
 from datasets import Dataset as Dataset2
+datasets.disable_caching()
 
 def load_data_text(
     batch_size, 
@@ -97,6 +98,8 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
         load_from_cache_file=True,
         desc="Running tokenizer on dataset",
     )
+    
+    
     print('### tokenized_datasets', tokenized_datasets)
     print('### tokenized_datasets...example', tokenized_datasets['input_id_x'][0])
     print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
@@ -129,8 +132,14 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
         merge_and_mask,
         batched=True,
         num_proc=1,
+        load_from_cache_file=False,
         desc=f"merge and mask",
     )
+    
+    raw = tokenized_datasets.to_dict()
+    raw['input_ids'] = _collate_batch_helper(raw['input_ids'], vocab_dict.pad_token_id, seq_len)
+    raw['input_mask'] = _collate_batch_helper(raw['input_mask'], 1, seq_len)
+    lm_datasets = Dataset2.from_dict(raw)
     
     def pad_function(group_lst):
         max_length = seq_len
@@ -138,14 +147,15 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
         group_lst['input_mask'] = _collate_batch_helper(group_lst['input_mask'], 1, max_length)
         return group_lst
 
-    print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+    """print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
 
     lm_datasets = tokenized_datasets.map(
         pad_function,
         batched=True,
         num_proc=1,
+        load_from_cache_file=False,
         desc=f"padding",
-    )
+    )"""
 
     print(lm_datasets, 'padded dataset')
     print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
