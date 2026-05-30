@@ -651,11 +651,8 @@ class GaussianDiffusion:
         tT_loss = mean_flat(out_mean ** 2)
 
         # decoder_nll: pass full sequence with t1/t2 masks; _token_discrete_loss handles averaging
-        nll1 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t1_mask.float())
-        nll2 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t2_mask.float())
-        decoder_nll = (nll1 + nll2) / 2
-
-        terms["nll"] = self._token_discrete_loss(out_avg, get_logits, input_ids_x, mask=t1_mask.float(), truncate=True, t=t)
+        decoder_nll = self._token_discrete_loss(x_start, get_logits, input_ids_x)
+        terms["nll"] = self._token_discrete_loss(model_out_x_start, get_logits, input_ids_x, mask=input_ids_mask, truncate=True, t=t)
 
         terms["decoder_nll"] = decoder_nll
         terms["tT_loss"] = tT_loss
