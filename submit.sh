@@ -1,13 +1,14 @@
 #!/bin/bash
 #SBATCH --account=uc3m-gts_c3_cluster_1-12
 #SBATCH --partition=gpu-batch
+#SBATCH --nodelist=srvgpu02
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:nvidia_a40:8
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=2-00:00:00
-#SBATCH --job-name=diffuseq-qqp-baseline
+#SBATCH --job-name=diffuseq-qqp-baseline-targetMSE
 #SBATCH --output=/lustre/uc3m/gts_c3_cluster_1-12/zualikha/logs/%j.out
 #SBATCH --error=/lustre/uc3m/gts_c3_cluster_1-12/zualikha/logs/%j.err
 
@@ -17,7 +18,7 @@ conda activate /lustre/uc3m/gts_c3_cluster_1-12/zualikha/envs/diffuseq
 cd /home/zualikha/DiffuSeq/scripts
 python -m torch.distributed.launch \
   --nproc_per_node=8 \
-  --master_port=12233 \
+  --master_port=12234 \
   --use_env run_train.py \
   --diff_steps 2000 \
   --lr 0.0001 \
@@ -32,4 +33,4 @@ python -m torch.distributed.launch \
   --vocab bert \
   --seq_len 128 \
   --schedule_sampler lossaware \
-  --notes test-qqp
+  --notes test-qqp-MSEtarget
