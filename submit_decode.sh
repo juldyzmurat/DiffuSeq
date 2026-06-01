@@ -18,6 +18,6 @@ conda activate /lustre/uc3m/gts_c3_cluster_1-12/zualikha/envs/diffuseq
 cd /home/zualikha/DiffuSeq/scripts
 python -u run_decode.py \
   --model_dir diffusion_models/diffuseq_qqp_h128_lr0.0001_t2000_sqrt_lossaware_seed102_test-qqp-ecctriple20260531-00:50:24 \
-  --pattern ema_0.9999_004000 \
+  --pattern ema_0.9999_005000 \
   --seed 123 \
   --split test 
