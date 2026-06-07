@@ -7,7 +7,7 @@
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=0-06:00:00
 #SBATCH --job-name=diffuseq-qqp-ecctriple-targetMSE
 #SBATCH --output=/lustre/uc3m/gts_c3_cluster_1-12/zualikha/logs/%j.out
 #SBATCH --error=/lustre/uc3m/gts_c3_cluster_1-12/zualikha/logs/%j.err
@@ -22,7 +22,7 @@ python -m torch.distributed.launch \
   --use_env run_train.py \
   --diff_steps 2000 \
   --lr 0.0001 \
-  --learning_steps 50000 \
+  --learning_steps 30000 \
   --save_interval 1000 \
   --seed 102 \
   --noise_schedule sqrt \

@@ -102,27 +102,32 @@ def helper_tokenize(sentence_lst, vocab_dict, seq_len):
     print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
 
     def merge_and_mask(group_lst):
+        print(f"DEBUG input_id_x[0]: {group_lst['input_id_x'][0]}")
+        print(f"DEBUG input_id_y[0]: {group_lst['input_id_y'][0]}")
+    
         lst = []
         mask = []
         target_lens = []
         for i in range(len(group_lst['input_id_x'])):
-            end_token = group_lst['input_id_x'][i][-1]
-            src = group_lst['input_id_x'][i][:-1]
-            trg = group_lst['input_id_y'][i][:-1]
-            while len(src) + 3*len(trg) > seq_len - 3:
-                if len(src)>len(trg):
-                    src.pop()
-                elif len(src)<len(trg):
-                    trg.pop()
-                else:
-                    src.pop()
-                    trg.pop()
-            src.append(end_token)
-            trg.append(end_token)
-
-            lst.append(src + [vocab_dict.sep_token_id] + trg + trg + trg)
-            mask.append([0]*(len(src)+1))
+            # Input format: [CLS] src_tokens [SEP]
+            # Remove both [CLS] and [SEP]
+            src = list(group_lst['input_id_x'][i][1:-2])  # skip first [CLS], skip last [SEP]
+            trg = list(group_lst['input_id_y'][i][1:-2])  # same for target
+            
+            end_token = 102  # [SEP]
+            
+            budget = seq_len - 3
+            if len(src) + len(trg) > budget:
+                half = budget // 2
+                src = src[:half]
+                trg = trg[:budget - len(src)]
+            
+            # Build: [src] [SEP] [trg + end_token] [trg + end_token] [trg + end_token]
+            trg_with_end = trg + [end_token]
+            lst.append(src + [vocab_dict.sep_token_id] + trg_with_end + trg_with_end + trg_with_end)
+            mask.append([0] * (len(src) + 1))  # mask = 0 for src + SEP
             target_lens.append(len(trg))
+        
         group_lst['input_ids'] = lst
         group_lst['input_mask'] = mask
         group_lst['target_len'] = target_lens
