@@ -618,13 +618,11 @@ class GaussianDiffusion:
         target = x_start
         model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
         assert model_output.shape == target.shape == x_start.shape
-        target_mask = input_ids_mask.unsqueeze(-1).expand_as(model_output).float()
-        target_count = target_mask.sum(dim=(1, 2)).clamp(min=1)
-        terms["mse"] = ((target - model_output) ** 2 * target_mask).sum(dim=(1, 2)) / target_count
+        terms["mse"] = mean_flat((target - model_output) ** 2)
 
         model_out_x_start = self._x0_helper(model_output, x_t, t)['pred_xstart'] # predicted_xstart = model_output
         t0_mask = (t == 0)
-        t0_loss = ((x_start_mean - model_out_x_start) ** 2 * target_mask).sum(dim=(1, 2)) / target_count
+        t0_loss = mean_flat((x_start_mean - model_out_x_start) ** 2)
         terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
 
         # tT_mask = (t == self.num_timesteps - 1)

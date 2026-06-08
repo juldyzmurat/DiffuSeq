@@ -167,7 +167,8 @@ class TrainLoop:
 
     def _setup_fp16(self):
         self.master_params = make_master_params(self.model_params)
-        self.model.convert_to_fp16()
+        #self.model.convert_to_fp16()
+        #self.model.to(th.float16)
 
     def run_loop(self):
         while (
@@ -222,11 +223,12 @@ class TrainLoop:
                 )
 
                 if last_batch or not self.use_ddp:
-                    losses = compute_losses()
+                    with th.cuda.amp.autocast():
+                        losses = compute_losses()
                 else:
                     with self.ddp_model.no_sync():
-                        losses = compute_losses()
-
+                        with th.cuda.amp.autocast():
+                            losses = compute_losses()
                 log_loss_dict(
                     self.diffusion, t, {f"eval_{k}": v * weights for k, v in losses.items()}
                 )
@@ -252,10 +254,12 @@ class TrainLoop:
             )
 
             if last_batch or not self.use_ddp:
-                losses = compute_losses()
+                with th.cuda.amp.autocast():
+                    losses = compute_losses()
             else:
                 with self.ddp_model.no_sync():
-                    losses = compute_losses()
+                    with th.cuda.amp.autocast():
+                        losses = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(

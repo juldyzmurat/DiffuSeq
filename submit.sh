@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:nvidia_a40:8
 #SBATCH --ntasks=8
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=256G
 #SBATCH --time=2-00:00:00
 #SBATCH --job-name=diffuseq-qqp-baseline-targetMSE
 #SBATCH --output=/lustre/uc3m/gts_c3_cluster_1-12/zualikha/logs/%j.out
@@ -30,7 +30,10 @@ python -m torch.distributed.launch \
   --bsz 2048 \
   --dataset qqp \
   --data_dir /home/zualikha/DiffuSeq/datasets/QQP/ \
+  --microbatch 256 \
   --vocab bert \
   --seq_len 128 \
   --schedule_sampler lossaware \
-  --notes test-qqp-MSEtarget
+  --notes test-qqp-MSEtarget_restart \
+  --resume_checkpoint diffusion_models/diffuseq_qqp_h128_lr0.0001_t2000_sqrt_lossaware_seed102_test-qqp20260530-16:40:18/ema_0.9999_014000.pt \
+  --app "--use_fp16 True --fp16_scale_growth 1e-3" \
