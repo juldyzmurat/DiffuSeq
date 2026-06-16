@@ -141,7 +141,9 @@ class GaussianDiffusion:
         sigma_small,
         use_kl,
         rescale_timesteps=False,
+        lambda_consistency=0.0, 
     ):
+        self.lambda_consistency = lambda_consistency
         self.rescale_timesteps = rescale_timesteps
         self.predict_xstart = predict_xstart
         self.rescale_learned_sigmas = rescale_learned_sigmas
@@ -579,21 +581,9 @@ class GaussianDiffusion:
             )
 
         return {'pred_xprev':pred_prev, 'pred_xstart':pred_xstart}
-
+    
     def training_losses_seq2seq(self, model, x_start, t, model_kwargs=None, noise=None):
-        """
-        Compute training losses for a single timestep.
-
-        :param model: the model to evaluate loss on.
-        :param x_start: the [N x C x ...] tensor of inputs. # not used unless fixing the input embeddings
-        :param t: a batch of timestep indices.
-        :param model_kwargs: if not None, a dict of extra keyword arguments to
-            pass to the model. This can be used for conditioning.
-        :param noise: if specified, the specific Gaussian noise to try to remove.
-        :return: a dict with the key "loss" containing a tensor of shape [N].
-                 Some mean or variance settings may also have other keys.
-        """
-        x_start_fix = x_start # save the orignal x_0
+        x_start_fix = x_start
         assert 'input_ids' in model_kwargs
         input_ids_x = model_kwargs.pop('input_ids').to(t.device)
         input_ids_mask = model_kwargs.pop('input_mask').to(t.device)
@@ -601,77 +591,62 @@ class GaussianDiffusion:
         x_start_mean = model.model.module.get_embeds(input_ids_x)
         
         std = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod,
-                                   th.tensor([0]).to(x_start_mean.device),
-                                   x_start_mean.shape)
-        # print(std.shape, )
-        # x_start_log_var = 2 * th.log(std)
+                                th.tensor([0]).to(x_start_mean.device),
+                                x_start_mean.shape)
         x_start = self._get_x_start(x_start_mean, std)
-        # print(x_start_mean.shape, x_start.shape)
         if noise is None:
             noise = th.randn_like(x_start)
 
-        x_t = self.q_sample(x_start, t, noise=noise, mask=input_ids_mask) # reparametrization trick.
+        x_t = self.q_sample(x_start, t, noise=noise, mask=input_ids_mask)
 
         get_logits = model.model.module.get_logits
-
         terms = {}
 
+        target = x_start
         model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
-        assert model_output.shape == x_start.shape
+        assert model_output.shape == target.shape == x_start.shape
+        terms["mse"] = mean_flat((target - model_output) ** 2)
 
-        # build per-position boolean masks for target1, target2, target3
-        context_len = (input_ids_mask == 0).sum(dim=-1)  # [B]
-        B, S, D = model_output.shape
-        positions = th.arange(S, device=model_output.device).unsqueeze(0).expand(B, -1)  # [B, S]
-        cl = context_len.unsqueeze(1)  # [B, 1]
-        tl = target_len.unsqueeze(1)   # [B, 1]
-        t1_mask = (positions >= cl) & (positions < cl + tl)
-        t2_mask = (positions >= cl + tl) & (positions < cl + 2 * tl)
-        t3_mask = (positions >= cl + 2 * tl) & (positions < cl + 3 * tl)
-        t1_mask_d = t1_mask.unsqueeze(-1).expand(-1, -1, D)
-
-        # align target2 and target3 to target1 positions via gather
-        gather_idx_t2 = (positions + tl).clamp(0, S - 1).unsqueeze(-1).expand(-1, -1, D)
-        gather_idx_t3 = (positions + 2 * tl).clamp(0, S - 1).unsqueeze(-1).expand(-1, -1, D)
-        shifted_output_t2 = th.gather(model_output, 1, gather_idx_t2)
-        shifted_output_t3 = th.gather(model_output, 1, gather_idx_t3)
-
-        # averaged output at target1 positions; elsewhere unchanged
-        out_avg = th.where(t1_mask_d, (model_output + shifted_output_t2 + shifted_output_t3) / 3, model_output)
-
-        # MSE: averaged over target1 positions only
-        t1_count = t1_mask_d.float().sum(dim=(1, 2)).clamp(min=1)
-        terms["mse"] = ((x_start - out_avg) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
-
-        # t0_loss with three-way averaging
         model_out_x_start = self._x0_helper(model_output, x_t, t)['pred_xstart']
-        shifted_x_start_t2 = th.gather(model_out_x_start, 1, gather_idx_t2)
-        shifted_x_start_t3 = th.gather(model_out_x_start, 1, gather_idx_t3)
-        out_avg_x_start = th.where(t1_mask_d, (model_out_x_start + shifted_x_start_t2 + shifted_x_start_t3) / 3, model_out_x_start)
-        t0_loss = ((x_start_mean - out_avg_x_start) ** 2 * t1_mask_d.float()).sum(dim=(1, 2)) / t1_count
         t0_mask = (t == 0)
+        t0_loss = mean_flat((x_start_mean - model_out_x_start) ** 2)
         terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
 
         out_mean, _, _ = self.q_mean_variance(x_start, th.LongTensor([self.num_timesteps - 1]).to(x_start.device))
         tT_loss = mean_flat(out_mean ** 2)
 
-        # decoder_nll: average across all three target spans
-        nll_src = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=(input_ids_mask == 0).float())
-        nll1 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t1_mask.float())
-        nll2 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t2_mask.float())
-        nll3 = self._token_discrete_loss(x_start, get_logits, input_ids_x, mask=t3_mask.float())
-        nll_tgt = (nll1 + nll2 + nll3) / 3
+        decoder_nll = self._token_discrete_loss(x_start, get_logits, input_ids_x)
+        terms["nll"] = self._token_discrete_loss(model_out_x_start, get_logits, input_ids_x, mask=input_ids_mask, truncate=True, t=t)
 
-        src_len = (input_ids_mask == 0).sum(dim=-1).float()  # [B]
-        tgt_len = target_len.float()                          # [B]
-        total_len = src_len + tgt_len
-        decoder_nll = (nll_src * src_len + nll_tgt * tgt_len) / total_len
+        # consistency loss across three target spans
+        context_len = (input_ids_mask == 0).sum(dim=-1)  # [B]
+        B, S, D = model_output.shape
 
-        terms["nll"] = self._token_discrete_loss(out_avg, get_logits, input_ids_x, mask=t1_mask.float(), truncate=True, t=t)
+        max_tl = target_len.max().item()
+        span_idx = th.arange(max_tl, device=model_output.device).unsqueeze(0)  # [1, max_tl]
+        valid_mask = (span_idx < target_len.unsqueeze(1)).unsqueeze(-1)  # [B, max_tl, 1]
+        b_idx = th.arange(B, device=model_output.device).unsqueeze(1)  # [B, 1]
 
-        terms["decoder_nll"] = decoder_nll
-        terms["tT_loss"] = tT_loss
-        terms["loss"] = terms["mse"] + decoder_nll + tT_loss
+        def extract_span(start):  # start: [B]
+            idx = (start.unsqueeze(1) + span_idx).clamp(0, S - 1)  # [B, max_tl]
+            return model_output[b_idx, idx, :]  # [B, max_tl, D]
+
+        output_t1 = extract_span(context_len)
+        output_t2 = extract_span(context_len + target_len)
+        output_t3 = extract_span(context_len + 2 * target_len)
+
+        denom = valid_mask.sum(dim=1).clamp(min=1)  # [B, 1]
+        consistency_loss = (
+            ((output_t1 - output_t2) ** 2 * valid_mask).sum(dim=1) / denom +
+            ((output_t1 - output_t3) ** 2 * valid_mask).sum(dim=1) / denom +
+            ((output_t2 - output_t3) ** 2 * valid_mask).sum(dim=1) / denom
+        ).mean(dim=-1) / 3  # [B]
+
+        terms["tT_loss"] = tT_loss.detach()
+        terms["decoder_nll"] = decoder_nll.detach()
+        terms["consistency"] = consistency_loss
+        lambda_consistency = self.lambda_consistency
+        terms["loss"] = terms["mse"] + decoder_nll + tT_loss + lambda_consistency * consistency_loss
 
         return terms
 

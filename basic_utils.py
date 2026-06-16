@@ -122,6 +122,7 @@ def create_model_and_diffusion(
     rescale_learned_sigmas,
     use_kl,
     notes,
+    lambda_consistency=0.0, 
     **kwargs,
 ):
     model = TransformerNetModel(
@@ -147,7 +148,8 @@ def create_model_and_diffusion(
         learn_sigmas = learn_sigma,
         sigma_small = sigma_small,
         use_kl = use_kl,
-        rescale_learned_sigmas=rescale_learned_sigmas
+        rescale_learned_sigmas=rescale_learned_sigmas,
+        lambda_consistency=lambda_consistency, 
     )
 
     return model, diffusion

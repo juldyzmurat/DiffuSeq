@@ -31,6 +31,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--notes', type=str, default='-', help='as training notes or specifical args')
     parser.add_argument('--app', type=str, default='', help='other input args')
+    parser.add_argument('--lambda_consistency', type=float, default=0.0, help='consistency loss weight')
+
     
     args = parser.parse_args()
 
@@ -40,7 +42,7 @@ if __name__ == '__main__':
     dname = os.path.dirname(dname)
     os.chdir(dname)
 
-    folder_name = "diffusion_models/"
+    folder_name = "/lustre/uc3m/gts_c3_cluster_1-12/zualikha/diffusion_models/"
 
     if int(os.environ['LOCAL_RANK']) == 0:
         if not os.path.isdir(folder_name):
@@ -59,20 +61,21 @@ if __name__ == '__main__':
             os.mkdir(Model_FILE)
 
     COMMANDLINE = f" OPENAI_LOGDIR={Model_FILE}  " \
-                  f"TOKENIZERS_PARALLELISM=false " \
-                  f"python train.py   " \
-                  f"--checkpoint_path {Model_FILE} " \
-                  f"--dataset {args.dataset} --data_dir {args.data_dir} --vocab {args.vocab} --use_plm_init {args.use_plm_init} " \
-                  f"--lr {args.lr} " \
-                  f"--batch_size {args.bsz} --microbatch {args.microbatch} " \
-                  f"--diffusion_steps {args.diff_steps} " \
-                  f"--noise_schedule {args.noise_schedule} " \
-                  f"--schedule_sampler {args.schedule_sampler} --resume_checkpoint {args.resume_checkpoint} " \
-                  f"--seq_len {args.seq_len} --hidden_t_dim {args.hidden_t_dim} --seed {args.seed} " \
-                  f"--hidden_dim {args.hidden_dim} " \
-                  f"--learning_steps {args.learning_steps} --save_interval {args.save_interval} " \
-                  f"--config_name {args.config_name} --notes {args.notes}"
+                    f"TOKENIZERS_PARALLELISM=false " \
+                    f"python train.py   " \
+                    f"--checkpoint_path {Model_FILE} " \
+                    f"--dataset {args.dataset} --data_dir {args.data_dir} --vocab {args.vocab} --use_plm_init {args.use_plm_init} " \
+                    f"--lr {args.lr} " \
+                    f"--batch_size {args.bsz} --microbatch {args.microbatch} " \
+                    f"--diffusion_steps {args.diff_steps} " \
+                    f"--noise_schedule {args.noise_schedule} " \
+                    f"--schedule_sampler {args.schedule_sampler} --resume_checkpoint {args.resume_checkpoint} " \
+                    f"--seq_len {args.seq_len} --hidden_t_dim {args.hidden_t_dim} --seed {args.seed} " \
+                    f"--hidden_dim {args.hidden_dim} " \
+                    f"--learning_steps {args.learning_steps} --save_interval {args.save_interval} " \
+                    f"--config_name {args.config_name} --notes {args.notes}"
 
+    COMMANDLINE += f" --lambda_consistency {args.lambda_consistency}"
     COMMANDLINE += " " + args.app
 
     if int(os.environ['LOCAL_RANK']) == 0:
