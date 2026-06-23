@@ -44,6 +44,7 @@ class TransformerNetModel(nn.Module):
         if config is None:
             config = AutoConfig.from_pretrained(config_name)
             config.hidden_dropout_prob = dropout
+            config._attn_implementation = "eager" 
 
         self.input_dims = input_dims
         self.hidden_t_dim = hidden_t_dim
